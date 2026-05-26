@@ -440,7 +440,7 @@ typedef struct iwEnv {
     float *rewards;
     float *actions;
     uint8_t *masks;
-    uint8_t *terminals;
+    float *terminals;
     uint8_t *truncations;
 
     uint8_t frameRate;

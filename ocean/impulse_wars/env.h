@@ -621,7 +621,7 @@ void setRewards(iwEnv *e, float winReward, float selfKillPunishment, float enemy
 void clearEnv(iwEnv *e) {
     // rewards get cleared in stepEnv every step
     // memset(e->masks, 1, e->numAgents * sizeof(uint8_t));
-    memset(e->terminals, 0x0, e->numAgents * sizeof(uint8_t));
+    memset(e->terminals, 0x0, e->numAgents * sizeof(float));
     memset(e->truncations, 0x0, e->numAgents * sizeof(uint8_t));
 
     e->episodeLength = 0;
@@ -1192,7 +1192,7 @@ void stepEnv(iwEnv *e) {
                     deadDrones++;
                     if (i < e->numAgents) {
                         if (drone->diedThisStep) {
-                            e->terminals[i] = 1;
+                            e->terminals[i] = 1.0f;
                         }
                         // else {
                         //     e->masks[i] = 0;
@@ -1231,7 +1231,9 @@ void stepEnv(iwEnv *e) {
                     memset(e->truncations, 1, e->numAgents * sizeof(uint8_t));
                 } else {
                     DEBUG_LOG("terminating episode");
-                    memset(e->terminals, 1, e->numAgents * sizeof(uint8_t));
+                    for (uint8_t i = 0; i < e->numAgents; i++) {
+                        e->terminals[i] = 1.0f;
+                    }
                 }
 
                 Log log = {0};

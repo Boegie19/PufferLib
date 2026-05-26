@@ -1,177 +1,161 @@
-#include <Python.h>
-
+// VecEnv-style binding for impulse_wars (puffer 4.0)
 #include "env.h"
 
-static PyObject *get_consts(PyObject *self, PyObject *args);
+// Max observation size (bytes) per agent for _MAX_DRONES (4)
+#define OBS_SIZE 1192
+#define NUM_ATNS 1
+#define ACT_SIZES { CONTINUOUS_ACTION_SIZE }
+#define OBS_TENSOR_T ByteTensor
 
+#define MY_VEC_INIT
 #define Env iwEnv
-#define MY_SHARED
-#define MY_METHODS {"get_consts", get_consts, METH_VARARGS, "Get constants"}
+#define MY_VEC_CLOSE
+#define num_agents numAgents
+#define action_mask masks
+#include "../../src/vecenv.h"
 
-#include "../env_binding.h"
+// Create vec of envs and initialize shared maps + per-env setup
+Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
+                 Dict* vec_kwargs, Dict* env_kwargs) {
+    int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
+    int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
+    int agents_per_buffer = total_agents / num_buffers;
 
-#define setDictVal(dict, key, val)                                            \
-    if (PyDict_SetItemString(dict, key, PyLong_FromLong(val)) < 0) {          \
-        PyErr_SetString(PyExc_RuntimeError, "Failed to set " key " in dict"); \
-        return NULL;                                                          \
+    // Allocate max possible envs (1 agent per env worst case)
+    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
+
+    int num_envs = 0;
+    int agents_created = 0;
+    while (agents_created < total_agents) {
+        srand(num_envs);
+        // default my_init will populate env->numAgents etc
+        my_init(&envs[num_envs], env_kwargs);
+        agents_created += envs[num_envs].numAgents;
+        num_envs++;
     }
 
-static PyObject *get_consts(PyObject *self, PyObject *args) {
-    PyObject *dronesArg = PyTuple_GetItem(args, 0);
-    if (!PyObject_TypeCheck(dronesArg, &PyLong_Type)) {
-        PyErr_SetString(PyExc_TypeError, "num_drones must be an integer");
-        return NULL;
-    }
-    const uint8_t numDrones = (uint8_t)PyLong_AsLong(dronesArg);
+    // Shrink to actual size needed
+    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
 
-    PyObject *dict = PyDict_New();
-    if (PyErr_Occurred()) {
-        return NULL;
+    // Initialize shared maps once and call per-env setup
+    initMaps(&envs[0]);
+    for (int i = 0; i < num_envs; i++) {
+        setupEnv(&envs[i]);
     }
 
-    const uint16_t droneObsOffset = ENEMY_DRONE_OBS_OFFSET + ((numDrones - 1) * ENEMY_DRONE_OBS_SIZE);
+    // Fill buffer info by iterating through envs
+    int buf = 0;
+    int buf_agents = 0;
+    buffer_env_starts[0] = 0;
+    buffer_env_counts[0] = 0;
+    for (int i = 0; i < num_envs; i++) {
+        buf_agents += envs[i].numAgents;
+        buffer_env_counts[buf]++;
+        if (buf_agents >= agents_per_buffer && buf < num_buffers - 1) {
+            buf++;
+            buffer_env_starts[buf] = i + 1;
+            buffer_env_counts[buf] = 0;
+            buf_agents = 0;
+        }
+    }
 
-    setDictVal(dict, "obsBytes", obsBytes(numDrones));
-    setDictVal(dict, "mapObsSize", MAP_OBS_SIZE);
-    setDictVal(dict, "discreteObsSize", discreteObsSize(numDrones));
-    setDictVal(dict, "continuousObsSize", continuousObsSize(numDrones));
-    setDictVal(dict, "continuousObsBytes", continuousObsSize(numDrones) * sizeof(float));
-    setDictVal(dict, "wallTypes", NUM_WALL_TYPES);
-    setDictVal(dict, "weaponTypes", NUM_WEAPONS + 1);
-    setDictVal(dict, "mapObsRows", MAP_OBS_ROWS);
-    setDictVal(dict, "mapObsColumns", MAP_OBS_COLUMNS);
-    setDictVal(dict, "continuousObsOffset", alignedSize(MAP_OBS_SIZE, sizeof(float)));
-    setDictVal(dict, "numNearWallObs", NUM_NEAR_WALL_OBS);
-    setDictVal(dict, "nearWallTypesObsOffset", NEAR_WALL_TYPES_OBS_OFFSET);
-    setDictVal(dict, "nearWallPosObsSize", NEAR_WALL_POS_OBS_SIZE);
-    setDictVal(dict, "nearWallObsSize", NEAR_WALL_OBS_SIZE);
-    setDictVal(dict, "nearWallPosObsOffset", NEAR_WALL_POS_OBS_OFFSET);
-    setDictVal(dict, "numFloatingWallObs", NUM_FLOATING_WALL_OBS);
-    setDictVal(dict, "floatingWallTypesObsOffset", FLOATING_WALL_TYPES_OBS_OFFSET);
-    setDictVal(dict, "floatingWallInfoObsSize", FLOATING_WALL_INFO_OBS_SIZE);
-    setDictVal(dict, "floatingWallObsSize", FLOATING_WALL_OBS_SIZE);
-    setDictVal(dict, "floatingWallInfoObsOffset", FLOATING_WALL_INFO_OBS_OFFSET);
-    setDictVal(dict, "numWeaponPickupObs", NUM_WEAPON_PICKUP_OBS);
-    setDictVal(dict, "weaponPickupTypesObsOffset", WEAPON_PICKUP_WEAPONS_OBS_OFFSET);
-    setDictVal(dict, "weaponPickupPosObsSize", WEAPON_PICKUP_POS_OBS_SIZE);
-    setDictVal(dict, "weaponPickupObsSize", WEAPON_PICKUP_OBS_SIZE);
-    setDictVal(dict, "weaponPickupPosObsOffset", WEAPON_PICKUP_POS_OBS_OFFSET);
-    setDictVal(dict, "numProjectileObs", NUM_PROJECTILE_OBS);
-    setDictVal(dict, "projectileDroneObsOffset", PROJECTILE_DRONE_OBS_OFFSET);
-    setDictVal(dict, "projectileTypesObsOffset", PROJECTILE_WEAPONS_OBS_OFFSET);
-    setDictVal(dict, "projectileInfoObsSize", PROJECTILE_INFO_OBS_SIZE);
-    setDictVal(dict, "projectileObsSize", PROJECTILE_OBS_SIZE);
-    setDictVal(dict, "projectileInfoObsOffset", PROJECTILE_INFO_OBS_OFFSET);
-    setDictVal(dict, "enemyDroneWeaponsObsOffset", ENEMY_DRONE_WEAPONS_OBS_OFFSET);
-    setDictVal(dict, "enemyDroneObsOffset", ENEMY_DRONE_OBS_OFFSET);
-    setDictVal(dict, "enemyDroneObsSize", ENEMY_DRONE_OBS_SIZE);
-    setDictVal(dict, "droneObsOffset", droneObsOffset);
-    setDictVal(dict, "droneObsSize", DRONE_OBS_SIZE);
-    setDictVal(dict, "miscObsSize", MISC_OBS_SIZE);
-    setDictVal(dict, "miscObsOffset", droneObsOffset + DRONE_OBS_SIZE);
-
-    setDictVal(dict, "maxDrones", MAX_DRONES);
-    setDictVal(dict, "contActionsSize", CONTINUOUS_ACTION_SIZE);
-
-    return dict;
+    *num_envs_out = num_envs;
+    return envs;
 }
 
-static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
-    VecEnv *ve = unpack_vecenv(args);
-    initMaps(ve->envs[0]);
-
-    for (uint16_t i = 0; i < ve->num_envs; i++) {
-        iwEnv *e = (iwEnv *)ve->envs[i];
-        setupEnv(e);
-    }
-
-    return Py_None;
+void my_vec_close(Env* envs) {
+    // default: nothing special to free here; maps destroyed elsewhere if needed
+    return;
 }
 
-static int my_init(iwEnv *e, PyObject *args, PyObject *kwargs) {
+// Initialize a single env from kwargs
+void my_init(Env* e, Dict* kwargs) {
+    e->numDrones = (uint8_t)dict_get(kwargs, "num_drones")->value;
+    e->numAgents = (uint8_t)dict_get(kwargs, "num_agents")->value;
+    int map_idx = (int)dict_get(kwargs, "map_idx")->value;
+    uint64_t seed = (uint64_t)dict_get(kwargs, "seed")->value;
+    bool enable_teams = (bool)dict_get(kwargs, "enable_teams")->value;
+    bool sitting_duck = (bool)dict_get(kwargs, "sitting_duck")->value;
+    bool is_training = (bool)dict_get(kwargs, "is_training")->value;
+    bool continuous = (bool)dict_get(kwargs, "continuous")->value;
+
     initEnv(
         e,
-        (uint8_t)unpack(kwargs, "num_drones"),
-        (uint8_t)unpack(kwargs, "num_agents"),
-        (int8_t)unpack(kwargs, "map_idx"),
-        (uint64_t)unpack(kwargs, "seed"),
-        (bool)unpack(kwargs, "enable_teams"),
-        (bool)unpack(kwargs, "sitting_duck"),
-        (bool)unpack(kwargs, "is_training"),
-        (bool)unpack(kwargs, "continuous")
+        (uint8_t)e->numDrones,
+        (uint8_t)e->numAgents,
+        (int8_t)map_idx,
+        (uint64_t)seed,
+        enable_teams,
+        sitting_duck,
+        is_training,
+        continuous
     );
+
     setRewards(
         e,
-        (float)unpack(kwargs, "reward_win"),
-        (float)unpack(kwargs, "reward_self_kill"),
-        (float)unpack(kwargs, "reward_enemy_death"),
-        (float)unpack(kwargs, "reward_enemy_kill"),
+        (float)dict_get(kwargs, "reward_win")->value,
+        (float)dict_get(kwargs, "reward_self_kill")->value,
+        (float)dict_get(kwargs, "reward_enemy_death")->value,
+        (float)dict_get(kwargs, "reward_enemy_kill")->value,
         0.0f, // teammate death punishment
         0.0f, // teammate kill punishment
-        (float)unpack(kwargs, "reward_death"),
-        (float)unpack(kwargs, "reward_energy_emptied"),
-        (float)unpack(kwargs, "reward_weapon_pickup"),
-        (float)unpack(kwargs, "reward_shield_break"),
-        (float)unpack(kwargs, "reward_shot_hit_coef"),
-        (float)unpack(kwargs, "reward_explosion_hit_coef")
+        (float)dict_get(kwargs, "reward_death")->value,
+        (float)dict_get(kwargs, "reward_energy_emptied")->value,
+        (float)dict_get(kwargs, "reward_weapon_pickup")->value,
+        (float)dict_get(kwargs, "reward_shield_break")->value,
+        (float)dict_get(kwargs, "reward_shot_hit_coef")->value,
+        (float)dict_get(kwargs, "reward_explosion_hit_coef")->value
     );
-    return 0;
 }
 
-#define _LOG_BUF_SIZE 128
+// Logging: convert env Log to Dict values
+void my_log(Log* log, Dict* out) {
+    dict_set(out, "episode_length", log->length);
+    dict_set(out, "ties", log->ties);
 
-char *droneLog(char *buf, const uint8_t droneIdx, const char *name) {
-    snprintf(buf, _LOG_BUF_SIZE, "drone_%d_%s", droneIdx, name);
-    return buf;
-}
+    dict_set(out, "perf", log->stats[0].wins);
+    dict_set(out, "score", log->stats[0].wins);
 
-char *weaponLog(char *buf, const uint8_t droneIdx, const uint8_t weaponIdx, const char *name) {
-    snprintf(buf, _LOG_BUF_SIZE, "drone_%d_%s_%s", droneIdx, weaponNames[weaponIdx], name);
-    return buf;
-}
-
-static int my_log(PyObject *dict, Log *log) {
-    assign_to_dict(dict, "episode_length", log->length);
-    assign_to_dict(dict, "ties", log->ties);
-
-    assign_to_dict(dict, "perf", log->stats[0].wins);
-    assign_to_dict(dict, "score", log->stats[0].wins);
-
-    char buf[_LOG_BUF_SIZE] = {0};
+    char buf[128];
     for (uint8_t i = 0; i < MAX_DRONES; i++) {
-        assign_to_dict(dict, droneLog(buf, i, "returns"), log->stats[i].returns);
-        assign_to_dict(dict, droneLog(buf, i, "distance_traveled"), log->stats[i].distanceTraveled);
-        assign_to_dict(dict, droneLog(buf, i, "abs_distance_traveled"), log->stats[i].absDistanceTraveled);
-        assign_to_dict(dict, droneLog(buf, i, "brake_time"), log->stats[i].brakeTime);
-        assign_to_dict(dict, droneLog(buf, i, "total_bursts"), log->stats[i].totalBursts);
-        assign_to_dict(dict, droneLog(buf, i, "bursts_hit"), log->stats[i].burstsHit);
-        assign_to_dict(dict, droneLog(buf, i, "energy_emptied"), log->stats[i].energyEmptied);
-        assign_to_dict(dict, droneLog(buf, i, "shields_broken"), log->stats[i].shieldsBroken);
-        assign_to_dict(dict, droneLog(buf, i, "own_shield_broken"), log->stats[i].ownShieldBroken);
-        assign_to_dict(dict, droneLog(buf, i, "self_kills"), log->stats[i].selfKills);
-        assign_to_dict(dict, droneLog(buf, i, "kills"), log->stats[i].kills);
-        assign_to_dict(dict, droneLog(buf, i, "unknown_kills"), log->stats[i].unknownKills);
-        assign_to_dict(dict, droneLog(buf, i, "wins"), log->stats[i].wins);
+        snprintf(buf, sizeof(buf), "drone_%d_returns", i);
+        dict_set(out, buf, log->stats[i].returns);
+        snprintf(buf, sizeof(buf), "drone_%d_distance_traveled", i);
+        dict_set(out, buf, log->stats[i].distanceTraveled);
+        snprintf(buf, sizeof(buf), "drone_%d_abs_distance_traveled", i);
+        dict_set(out, buf, log->stats[i].absDistanceTraveled);
+        snprintf(buf, sizeof(buf), "drone_%d_brake_time", i);
+        dict_set(out, buf, log->stats[i].brakeTime);
+        snprintf(buf, sizeof(buf), "drone_%d_total_bursts", i);
+        dict_set(out, buf, log->stats[i].totalBursts);
+        snprintf(buf, sizeof(buf), "drone_%d_bursts_hit", i);
+        dict_set(out, buf, log->stats[i].burstsHit);
+        snprintf(buf, sizeof(buf), "drone_%d_energy_emptied", i);
+        dict_set(out, buf, log->stats[i].energyEmptied);
+        snprintf(buf, sizeof(buf), "drone_%d_shields_broken", i);
+        dict_set(out, buf, log->stats[i].shieldsBroken);
+        snprintf(buf, sizeof(buf), "drone_%d_own_shield_broken", i);
+        dict_set(out, buf, log->stats[i].ownShieldBroken);
+        snprintf(buf, sizeof(buf), "drone_%d_self_kills", i);
+        dict_set(out, buf, log->stats[i].selfKills);
+        snprintf(buf, sizeof(buf), "drone_%d_kills", i);
+        dict_set(out, buf, log->stats[i].kills);
+        snprintf(buf, sizeof(buf), "drone_%d_unknown_kills", i);
+        dict_set(out, buf, log->stats[i].unknownKills);
+        snprintf(buf, sizeof(buf), "drone_%d_wins", i);
+        dict_set(out, buf, log->stats[i].wins);
 
-        // useful for debugging weapon balance, but really slows down
-        // sweeps due to adding a ton of extra logging data
-        //
-        // for (uint8_t j = 0; j < _NUM_WEAPONS; j++) {
-        //     assign_to_dict(dict, weaponLog(buf, i, j, "shots_fired"), log->stats[i].shotsFired[j]);
-        //     assign_to_dict(dict, weaponLog(buf, i, j, "shots_hit"), log->stats[i].shotsHit[j]);
-        //     assign_to_dict(dict, weaponLog(buf, i, j, "shots_taken"), log->stats[i].shotsTaken[j]);
-        //     assign_to_dict(dict, weaponLog(buf, i, j, "own_shots_taken"), log->stats[i].ownShotsTaken[j]);
-        //     assign_to_dict(dict, weaponLog(buf, i, j, "picked_up"), log->stats[i].weaponsPickedUp[j]);
-        //     assign_to_dict(dict, weaponLog(buf, i, j, "shot_distances"), log->stats[i].shotDistances[j]);
-        // }
-
-        assign_to_dict(dict, droneLog(buf, i, "total_shots_fired"), log->stats[i].totalShotsFired);
-        assign_to_dict(dict, droneLog(buf, i, "total_shots_hit"), log->stats[i].totalShotsHit);
-        assign_to_dict(dict, droneLog(buf, i, "total_shots_taken"), log->stats[i].totalShotsTaken);
-        assign_to_dict(dict, droneLog(buf, i, "total_own_shots_taken"), log->stats[i].totalOwnShotsTaken);
-        assign_to_dict(dict, droneLog(buf, i, "total_picked_up"), log->stats[i].totalWeaponsPickedUp);
-        assign_to_dict(dict, droneLog(buf, i, "total_shot_distances"), log->stats[i].totalShotDistances);
+        snprintf(buf, sizeof(buf), "drone_%d_total_shots_fired", i);
+        dict_set(out, buf, log->stats[i].totalShotsFired);
+        snprintf(buf, sizeof(buf), "drone_%d_total_shots_hit", i);
+        dict_set(out, buf, log->stats[i].totalShotsHit);
+        snprintf(buf, sizeof(buf), "drone_%d_total_shots_taken", i);
+        dict_set(out, buf, log->stats[i].totalShotsTaken);
+        snprintf(buf, sizeof(buf), "drone_%d_total_own_shots_taken", i);
+        dict_set(out, buf, log->stats[i].totalOwnShotsTaken);
+        snprintf(buf, sizeof(buf), "drone_%d_total_picked_up", i);
+        dict_set(out, buf, log->stats[i].totalWeaponsPickedUp);
+        snprintf(buf, sizeof(buf), "drone_%d_total_shot_distances", i);
+        dict_set(out, buf, log->stats[i].totalShotDistances);
     }
-
-    return 0;
 }
