@@ -119,7 +119,7 @@ typedef struct wallEntity {
     bool isFloating;
     enum entityType type;
     bool isSuddenDeath;
-    CC_Array *physicsTracking;
+    b2Vec2 contributions[_MAX_DRONES];
 
     entity *ent;
 } wallEntity;
@@ -247,13 +247,7 @@ typedef struct dronePieceEntity {
     uint16_t lifetime;
 } dronePieceEntity;
 
-typedef struct physicsStepInfo {
-    uint8_t srcIdx;
-    b2Vec2 impulse;
-    b2Vec2 force;
-    bool brakeToggled;
-    uint16_t step;
-} physicsStepInfo;
+
 
 typedef struct droneEntity {
     b2BodyId bodyID;
@@ -290,7 +284,7 @@ typedef struct droneEntity {
     uint8_t livesLeft;
     bool dead;
 
-    CC_Array *physicsTracking;
+    b2Vec2 contributions[_MAX_DRONES];
     int8_t killedBy;
     bool killed[_MAX_DRONES];
 
@@ -492,7 +486,11 @@ typedef struct iwEnv {
     rayClient *client;
     float renderScale;
     CC_Array *explosions;
+    CC_Array *projectilePool;
+    CC_Array *dronePiecePool;
+    CC_Array *explosionPool;
     CC_Array *debugPoints;
+
 } iwEnv;
 
 #endif

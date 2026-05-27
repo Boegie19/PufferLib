@@ -21,8 +21,23 @@ const uint8_t FOUR_BIT_MASK = 0xf;
 // pufferlib compatibility
 #define c_step stepEnv
 #define c_reset resetEnv
-#define c_render setupRayClient
 #define c_close destroyEnv
+
+// In Puffer, render() is expected to draw a frame, not just initialize rendering.
+// `setupRayClient()` only creates the window/client and flags a reset; it does not
+// call BeginDrawing()/renderEnv(). That manifests as a black screen in eval.
+static inline void c_render(iwEnv *e) {
+    setupRayClient(e);
+    if (e->client == NULL || e->map == NULL || e->drones == NULL) {
+        return;
+    }
+
+    // If the window is created after setupEnv() already ran, we still need a camera.
+    setupEnvCamera(e);
+
+    // Draw a frame immediately (even before the next step()).
+    renderEnv(e, false, false, -1, -1);
+}
 
 // returns a cell index that is closest to pos that isn't cellIdx
 uint16_t findNearestCell(const iwEnv *e, const b2Vec2 pos, const uint16_t cellIdx) {
@@ -587,6 +602,11 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     create_array(&e->explodingProjectiles, 8);
     create_array(&e->dronePieces, 16);
 
+    create_array(&e->projectilePool, 128);
+    create_array(&e->dronePiecePool, 128);
+    create_array(&e->explosionPool, 32);
+
+
     e->mapPathing = fastCalloc(NUM_MAPS, sizeof(pathingInfo));
     for (uint8_t i = 0; i < NUM_MAPS; i++) {
         const mapEntry *map = maps[i];
@@ -707,6 +727,28 @@ void destroyEnv(iwEnv *e) {
     cc_array_destroy(e->explosions);
     cc_array_destroy(e->explodingProjectiles);
     cc_array_destroy(e->dronePieces);
+
+    for (size_t i = 0; i < cc_array_size(e->projectilePool); i++) {
+        void *p;
+        cc_array_get_at(e->projectilePool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->projectilePool);
+
+    for (size_t i = 0; i < cc_array_size(e->dronePiecePool); i++) {
+        void *p;
+        cc_array_get_at(e->dronePiecePool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->dronePiecePool);
+
+    for (size_t i = 0; i < cc_array_size(e->explosionPool); i++) {
+        void *p;
+        cc_array_get_at(e->explosionPool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->explosionPool);
+
 
     b2DestroyWorld(e->worldID);
 
@@ -1148,6 +1190,8 @@ void stepEnv(iwEnv *e) {
             }
 
             b2World_Step(e->worldID, e->deltaTime, e->box2dSubSteps);
+            dampTrackedPhysics(e);
+
 
             // update dynamic body positions and velocities
             handleBodyMoveEvents(e);

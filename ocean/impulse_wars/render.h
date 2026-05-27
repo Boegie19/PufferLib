@@ -939,10 +939,11 @@ void renderExplosions(const iwEnv *e) {
         if (explosion->renderSteps == UINT16_MAX) {
             explosion->renderSteps = maxRenderSteps;
         } else if (explosion->renderSteps == 0) {
-            fastFree(explosion);
+            cc_array_add(e->explosionPool, explosion);
             cc_array_iter_remove(&iter, NULL);
             continue;
         }
+
 
         // color bursts with a bit of the parent drone's color
         const float alpha = (float)explosion->renderSteps / maxRenderSteps;
@@ -1524,7 +1525,7 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
         minimalStepEnv(e);
     }
 
-    // UpdateCamera(&e->client->camera3D, CAMERA_ORBITAL);
+    UpdateCamera(&e->client->camera->camera3D, CAMERA_ORBITAL);
 
     updateCamera(e);
 
