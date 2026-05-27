@@ -59,11 +59,11 @@ const float droneThrusterLength = 1.5f * DRONE_RADIUS;
 const float aimGuideLength = 0.3f * DRONE_RADIUS;
 const float chargedAimGuideLength = DRONE_RADIUS;
 
-static inline b2Vec2 rayVecToB2Vec(const iwEnv *e, const Vector2 v) {
-    return (b2Vec2){.x = (v.x - e->client->halfWidth) / e->renderScale, .y = ((v.y - e->client->halfHeight - (2 * e->renderScale)) / e->renderScale)};
+static inline fsVec2 rayVecToFsVec(const iwEnv *e, const Vector2 v) {
+    return (fsVec2){.x = (v.x - e->client->halfWidth) / e->renderScale, .y = ((v.y - e->client->halfHeight - (2 * e->renderScale)) / e->renderScale)};
 }
 
-void updateTrailPoints(trailPoints *tp, const uint8_t maxLen, const b2Vec2 pos) {
+void updateTrailPoints(trailPoints *tp, const uint8_t maxLen, const fsVec2 pos) {
     const Vector2 v = (Vector2){.x = pos.x, .y = pos.y};
     if (tp->length < maxLen) {
         tp->points[tp->length++] = v;
@@ -126,22 +126,25 @@ rayClient *createRayClient() {
     client->projRawTex = LoadRenderTexture(client->width, client->height);
     client->projBloomTex = LoadRenderTexture(client->width, client->height);
 
-    const char *gridVSPath = TextFormat("resources/impulse_wars/shaders/gls%i/shader.vs", GLSL_VERSION);
-    const char *gridFSPath = TextFormat("resources/impulse_wars/shaders/gls%i/grid.fs", GLSL_VERSION);
-    client->gridShader = LoadShader(gridVSPath, gridFSPath);
+    client->gridShader = LoadShader(
+        TextFormat("resources/impulse_wars/shaders/gls%i/shader.vs", GLSL_VERSION),
+        TextFormat("resources/impulse_wars/shaders/gls%i/grid.fs", GLSL_VERSION)
+    );
     for (int i = 0; i < 4; i++) {
         client->gridShaderPosLoc[i] = GetShaderLocation(client->gridShader, TextFormat("pos[%i]", i));
         client->gridShaderColorLoc[i] = GetShaderLocation(client->gridShader, TextFormat("color[%i]", i));
     }
 
-    const char *blurVSPath = TextFormat("resources/impulse_wars/shaders/gls%i/shader.vs", GLSL_VERSION);
-    const char *blurFSPath = TextFormat("resources/impulse_wars/shaders/gls%i/blur.fs", GLSL_VERSION);
-    client->blurShader = LoadShader(blurVSPath, blurFSPath);
+    client->blurShader = LoadShader(
+        TextFormat("resources/impulse_wars/shaders/gls%i/shader.vs", GLSL_VERSION),
+        TextFormat("resources/impulse_wars/shaders/gls%i/blur.fs", GLSL_VERSION)
+    );
     client->blurShaderDirLoc = GetShaderLocation(client->blurShader, "uTexelDir");
 
-    const char *bloomVSPath = TextFormat("resources/impulse_wars/shaders/gls%i/shader.vs", GLSL_VERSION);
-    const char *bloomFSPath = TextFormat("resources/impulse_wars/shaders/gls%i/bloom.fs", GLSL_VERSION);
-    client->bloomShader = LoadShader(bloomVSPath, bloomFSPath);
+    client->bloomShader = LoadShader(
+        TextFormat("resources/impulse_wars/shaders/gls%i/shader.vs", GLSL_VERSION),
+        TextFormat("resources/impulse_wars/shaders/gls%i/bloom.fs", GLSL_VERSION)
+    );
     int32_t bloomModeLoc = GetShaderLocation(client->bloomShader, "uBloomMode");
     const int32_t bloomMode = 1;
     SetShaderValue(client->bloomShader, bloomModeLoc, &bloomMode, SHADER_UNIFORM_INT);
@@ -936,10 +939,11 @@ void renderExplosions(const iwEnv *e) {
         if (explosion->renderSteps == UINT16_MAX) {
             explosion->renderSteps = maxRenderSteps;
         } else if (explosion->renderSteps == 0) {
-            fastFree(explosion);
+            cc_array_add(e->explosionPool, explosion);
             cc_array_iter_remove(&iter, NULL);
             continue;
         }
+
 
         // color bursts with a bit of the parent drone's color
         const float alpha = (float)explosion->renderSteps / maxRenderSteps;
@@ -1023,7 +1027,7 @@ void renderWall(const iwEnv *e, const wallEntity *wall) {
 
     float angle = 0.0f;
     if (wall->isFloating) {
-        angle = b2Rot_GetAngle(wall->rot);
+        angle = fsRot_GetAngle(wall->rot);
         angle *= RAD2DEG;
     }
 
@@ -1122,7 +1126,7 @@ void renderDronePieces(iwEnv *e) {
         const float alpha = 1.0f - (baseAlpha * ((float)piece->lifetime / maxLifetime));
         const float finalAlpha = 1.0f - (SQUARED(alpha) * alpha);
         const Color color = Fade(getDroneColor(piece->droneIdx), finalAlpha);
-        const float angle = RAD2DEG * b2Rot_GetAngle(piece->rot);
+        const float angle = RAD2DEG * fsRot_GetAngle(piece->rot);
 
         // Draw edges of the triangle
         rlPushMatrix();
@@ -1175,26 +1179,19 @@ void renderDroneRespawnGuides(const iwEnv *e, droneEntity *drone) {
     drone->respawnGuideLifetime--;
 }
 
-b2RayResult droneAimingAt(const iwEnv *e, const droneEntity *drone) {
-    const b2Vec2 rayEnd = b2MulAdd(drone->pos, 150.0f, drone->lastAim);
-    const b2Vec2 translation = b2Sub(rayEnd, drone->pos);
-    const b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | DRONE_SHAPE};
-    return b2World_CastRayClosest(e->worldID, drone->pos, translation, filter);
+fsRayCastResult droneAimingAt(const iwEnv *e, const droneEntity *drone) {
+    return fsRayCast(&e->world, drone->pos, drone->lastAim, 150.0f, (entity*)drone->ent);
 }
 
 void renderDroneAimGuide(const iwEnv *e, const droneEntity *drone) {
-    // find length of laser aiming guide by where it touches the nearest shape
-    const b2RayResult rayRes = droneAimingAt(e, drone);
-    ASSERT(b2Shape_IsValid(rayRes.shapeId));
-    const entity *ent = b2Shape_GetUserData(rayRes.shapeId);
-
-    const b2DistanceOutput output = closestPoint(drone->ent, ent);
+    fsRayCastResult rayRes = droneAimingAt(e, drone);
+    float distance = rayRes.hit ? rayRes.fraction * 150.0f : 150.0f;
+    
     float aimGuideWidth = getWeaponAimGuideWidth(drone->weaponInfo->type);
-    aimGuideWidth = min(aimGuideWidth, output.distance + 0.1f) + (DRONE_RADIUS * 2.0f);
+    aimGuideWidth = min(aimGuideWidth, distance + 0.1f) + (DRONE_RADIUS * 2.0f);
 
-    // render laser aim guide
-    const b2Vec2 pos = b2MulAdd(drone->pos, aimGuideWidth / 2.0f, drone->lastAim);
-    const float aimAngle = RAD2DEG * b2Atan2(drone->lastAim.y, drone->lastAim.x);
+    const fsVec2 pos = fsMulAdd(drone->pos, aimGuideWidth / 2.0f, drone->lastAim);
+    const float aimAngle = RAD2DEG * atan2f(drone->lastAim.y, drone->lastAim.x);
 
     rlPushMatrix();
     rlTranslatef(pos.x, 0.0f, pos.y);
@@ -1208,12 +1205,12 @@ void renderDroneAimGuide(const iwEnv *e, const droneEntity *drone) {
 
 void renderDroneGuides(iwEnv *e, const droneEntity *drone, const bool ending) {
     // render thruster move guide
-    if (!b2VecEqual(drone->lastMove, b2Vec2_zero) && !ending) {
-        const float moveMagnitude = b2Length(drone->lastMove);
-        const float thrusterAngle = RAD2DEG * b2Atan2(-drone->lastMove.y, -drone->lastMove.x);
+    if (!fsVecEqual(drone->lastMove, fsVec2_zero) && !ending) {
+        const float moveMagnitude = fsLength(drone->lastMove);
+        const float thrusterAngle = RAD2DEG * atan2f(-drone->lastMove.y, -drone->lastMove.x);
         const float flickerWidth = randFloat(&e->randState, -0.05f, 0.05f);
         const float thrusterWidth = 2.5f * ((halfDroneRadius * moveMagnitude) + halfDroneRadius + flickerWidth);
-        const b2Vec2 thrusterPos = b2MulAdd(drone->pos, -thrusterWidth / 2.0f, drone->lastMove);
+        const fsVec2 thrusterPos = fsMulAdd(drone->pos, -thrusterWidth / 2.0f, drone->lastMove);
         const Color thrusterColor = Fade(getDroneColor(drone->idx), 0.9);
 
         rlPushMatrix();
@@ -1494,16 +1491,16 @@ void minimalStepEnv(iwEnv *e) {
         if (drone->dead || drone->shield == NULL) {
             continue;
         }
+        // update shield velocity/pos if its active
+        drone->shield->body->pos = drone->body->pos;
+        drone->shield->body->vel = drone->body->vel;
+    }
 
-        // update shield velocity if its active
-        b2Body_SetLinearVelocity(drone->shield->bodyID, b2Body_GetLinearVelocity(drone->bodyID));
-    };
-
-    b2World_Step(e->worldID, e->deltaTime, e->box2dSubSteps);
+    fsWorld_Step(&e->world, e->deltaTime);
+    dampTrackedPhysics(e);
 
     handleBodyMoveEvents(e);
     handleContactEvents(e);
-    handleSensorEvents(e);
 
     projectilesStep(e);
 

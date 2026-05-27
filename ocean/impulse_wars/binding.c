@@ -2,7 +2,13 @@
 #include "env.h"
 
 // Max observation size (bytes) per agent for _MAX_DRONES (4)
-#define OBS_SIZE 1192
+#define OBS_SIZE 998 // for 2 drones (players)
+// actions:
+// 9: move, noop + 8 directions
+// 17: aim, noop + 16 directions
+// 2: shoot or not
+// 2: brake or not
+// 2: burst or not
 #define NUM_ATNS 1
 #define ACT_SIZES { CONTINUOUS_ACTION_SIZE }
 #define OBS_TENSOR_T ByteTensor

@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <time.h>
 
-#include "box2d/box2d.h"
+#include "fast_sim.h"
 
 #include "include/cc_array.h"
 
@@ -103,7 +103,7 @@
 #define ASSERT_VEC_NORMALIZED(vec)                                                                           \
     ASSERT_VEC_BOUNDED(vec);                                                                                 \
     do {                                                                                                     \
-        const b2Vec2 norm = b2Normalize(vec);                                                                \
+        const fsVec2 norm = fsNormalize(vec);                                                                \
         MAYBE_UNUSED(norm);                                                                                  \
         ASSERTF(fabs(vec.x - norm.x) < 0.000001f, "vec: %f, %f norm: %f, %f", vec.x, vec.y, norm.x, norm.y); \
         ASSERTF(fabs(vec.y - norm.y) < 0.000001f, "vec: %f, %f norm: %f, %f", vec.x, vec.y, norm.x, norm.y); \
@@ -113,7 +113,7 @@
 // heap memory, use dlmalloc in release mode for performance; emscripten
 // uses dlmalloc by default so no need to change anything here; dlmalloc
 // sometimes won't compile on macOS so just use malloc and friends
-#if !defined(NDEBUG) || defined(__EMSCRIPTEN__) || defined(__APPLE__)
+#if !defined(NDEBUG) || defined(__EMSCRIPTEN__) || defined(__APPLE__) || defined(__linux__)
 #define fastMalloc(size) malloc(size)
 #define fastMallocFn malloc
 #define fastCalloc(nmemb, size) calloc(nmemb, size)
@@ -151,9 +151,6 @@ static inline void *safe_array_get_at(const CC_Array *const array, size_t index)
     return val;
 }
 
-static inline bool b2VecEqual(const b2Vec2 v1, const b2Vec2 v2) {
-    return v1.x == v2.x && v1.y == v2.y;
-}
 
 // from https://lemire.me/blog/2019/03/19/the-fastest-conventional-random-number-generator-that-can-pass-big-crush/
 // see also https://github.com/lemire/testingRNG

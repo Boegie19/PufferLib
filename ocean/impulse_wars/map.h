@@ -462,7 +462,7 @@ void setupMap(iwEnv *e, const uint8_t mapIdx) {
             const float x = (col - ((columns - 1) * 0.5f)) * WALL_THICKNESS;
             const float y = (row - (rows - 1) * 0.5f) * WALL_THICKNESS;
 
-            b2Vec2 pos = {.x = x, .y = y};
+            fsVec2 pos = {.x = x, .y = y};
             mapCell *cell = fastCalloc(1, sizeof(mapCell));
             cell->ent = NULL;
             cell->pos = pos;
@@ -516,60 +516,57 @@ void computeMapBoundsAndQuadrants(iwEnv *e, mapEntry *map) {
     }
     map->bounds = bounds;
     map->spawnQuads[0] = (mapBounds){
-        .min = (b2Vec2){
+        .min = (fsVec2){
             .x = map->bounds.min.x + WALL_THICKNESS,
             .y = map->bounds.min.y + WALL_THICKNESS,
         },
-        .max = (b2Vec2){
+        .max = (fsVec2){
             .x = 0.0f,
             .y = 0.0f,
         }
     };
     map->spawnQuads[1] = (mapBounds){
-        .min = (b2Vec2){
+        .min = (fsVec2){
             .x = 0.0f,
             .y = map->bounds.min.y + WALL_THICKNESS,
         },
-        .max = (b2Vec2){
+        .max = (fsVec2){
             .x = map->bounds.max.x - WALL_THICKNESS,
             .y = 0.0f,
         }
     };
     map->spawnQuads[2] = (mapBounds){
-        .min = (b2Vec2){
+        .min = (fsVec2){
             .x = map->bounds.min.x + WALL_THICKNESS,
             .y = 0.0f,
         },
-        .max = (b2Vec2){
+        .max = (fsVec2){
             .x = 0.0f,
             .y = map->bounds.max.y - WALL_THICKNESS,
         }
     };
     map->spawnQuads[3] = (mapBounds){
-        .min = (b2Vec2){
+        .min = (fsVec2){
             .x = 0.0f,
             .y = 0.0f,
         },
-        .max = (b2Vec2){
+        .max = (fsVec2){
             .x = map->bounds.max.x - WALL_THICKNESS,
             .y = map->bounds.max.y - WALL_THICKNESS,
         }
     };
 }
 
-bool posValidDroneSpawnPoint(const iwEnv *e, const b2Vec2 pos) {
-    const b2QueryFilter filter = {
-        .categoryBits = DRONE_SHAPE,
-        .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE,
-    };
+bool posValidDroneSpawnPoint(const iwEnv *e, const fsVec2 pos) {
+    const uint32_t maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE;
     droneEntity dummyDrone = {.pos = pos};
     const entity ent = {.type = DRONE_ENTITY, .entity = &dummyDrone};
     const enum entityType deathWallType = DEATH_WALL_ENTITY;
 
-    if (isOverlappingCircleInLineOfSight(e, &ent, pos, DRONE_DEATH_WALL_SPAWN_DISTANCE, filter, &deathWallType)) {
+    if (isOverlappingCircleInLineOfSight(e, &ent, pos, DRONE_DEATH_WALL_SPAWN_DISTANCE, 0, maskBits, &deathWallType)) {
         return false;
     }
-    if (isOverlappingAABB(e, pos, DRONE_WALL_SPAWN_DISTANCE, filter)) {
+    if (isOverlappingCircleInLineOfSight(e, &ent, pos, DRONE_WALL_SPAWN_DISTANCE, 0, maskBits, NULL)) {
         return false;
     }
 
@@ -610,7 +607,7 @@ void initMaps(iwEnv *e) {
                 }
 
                 walls[wallIdx].idx = wallIdx;
-                walls[wallIdx].distanceSquared = b2DistanceSquared(cell->pos, c->pos);
+                walls[wallIdx].distanceSquared = fsDistanceSq(cell->pos, c->pos);
                 wallIdx++;
             }
             insertionSort(walls, wallIdx);
@@ -643,7 +640,7 @@ void destroyMaps() {
 }
 
 void placeRandFloatingWall(iwEnv *e, const enum entityType wallType) {
-    b2Vec2 pos;
+    fsVec2 pos;
     if (!findOpenPos(e, FLOATING_WALL_SHAPE, &pos, -1)) {
         ERROR("failed to find open position for floating wall");
     }

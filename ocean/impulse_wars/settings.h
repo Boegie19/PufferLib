@@ -677,36 +677,6 @@ int8_t weaponAmmo(const enum weaponType defaultWep, const enum weaponType type) 
     }
 }
 
-b2ShapeId weaponSensor(const b2BodyId bodyID, const enum weaponType type) {
-    b2ShapeDef sensorShapeDef = b2DefaultShapeDef();
-    sensorShapeDef.density = 0.0f;
-    sensorShapeDef.isSensor = true;
-    sensorShapeDef.enableSensorEvents = true;
-    b2Circle sensorCircle = {.center = b2Vec2_zero};
-
-    switch (type) {
-    case FLAK_CANNON_WEAPON:
-        sensorShapeDef.filter.categoryBits = PROJECTILE_SHAPE;
-        sensorShapeDef.filter.maskBits = DRONE_SHAPE;
-        sensorCircle.radius = FLAK_CANNON_PROXIMITY_RADIUS;
-        break;
-    case MINE_LAUNCHER_WEAPON:
-        sensorShapeDef.filter.categoryBits = PROJECTILE_SHAPE;
-        sensorShapeDef.filter.maskBits = DRONE_SHAPE;
-        sensorCircle.radius = MINE_LAUNCHER_PROXIMITY_RADIUS;
-        break;
-    case BLACK_HOLE_WEAPON:
-        sensorShapeDef.filter.categoryBits = PROJECTILE_SHAPE;
-        sensorShapeDef.filter.maskBits = FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE;
-        sensorCircle.radius = BLACK_HOLE_PROXIMITY_RADIUS;
-        break;
-    default:
-        ERRORF("unknown weapon type with sensor %d", type);
-    }
-
-    return b2CreateCircleShape(bodyID, &sensorShapeDef, &sensorCircle);
-}
-
 // amount of force to apply to projectile
 float weaponFire(uint64_t *seed, const enum weaponType type) {
     switch (type) {
@@ -739,31 +709,34 @@ float weaponFire(uint64_t *seed, const enum weaponType type) {
     }
 }
 
-b2Vec2 weaponAdjustAim(uint64_t *seed, const enum weaponType type, const uint16_t heat, const b2Vec2 normAim) {
+fsVec2 weaponAdjustAim(uint64_t *seed, const enum weaponType type, const uint16_t heat, const fsVec2 normAim) {
     switch (type) {
     case MACHINEGUN_WEAPON: {
         const float swayCoef = logBasef((heat / 5.0f) + 1, 180);
         const float maxSway = 0.1f;
         const float swayX = randFloat(seed, maxSway * -swayCoef, maxSway * swayCoef);
         const float swayY = randFloat(seed, maxSway * -swayCoef, maxSway * swayCoef);
-        b2Vec2 machinegunAim = {.x = normAim.x + swayX, .y = normAim.y + swayY};
-        return b2Normalize(machinegunAim);
+        fsVec2 machinegunAim = {.x = normAim.x + swayX, .y = normAim.y + swayY};
+        return fsNormalize(machinegunAim);
     }
     case SHOTGUN_WEAPON: {
         const float maxOffset = 0.11f;
         const float offsetX = randFloat(seed, -maxOffset, maxOffset);
         const float offsetY = randFloat(seed, -maxOffset, maxOffset);
-        b2Vec2 shotgunAim = {.x = normAim.x + offsetX, .y = normAim.y + offsetY};
-        return b2Normalize(shotgunAim);
+        fsVec2 shotgunAim = {.x = normAim.x + offsetX, .y = normAim.y + offsetY};
+        return fsNormalize(shotgunAim);
     }
     default:
         return normAim;
     }
 }
 
-// sets explosion parameters and returns true if an explosion should be created
-// when a projectile is destroyed
-void weaponExplosion(const enum weaponType type, b2ExplosionDef *explosionDef) {
+typedef struct {
+    float radius;
+    float impulsePerLength;
+} fsExplosionDef;
+
+void weaponExplosion(const enum weaponType type, fsExplosionDef *explosionDef) {
     switch (type) {
     case IMPLODER_WEAPON:
         explosionDef->radius = 15.0f;
@@ -771,8 +744,6 @@ void weaponExplosion(const enum weaponType type, b2ExplosionDef *explosionDef) {
         return;
     case FLAK_CANNON_WEAPON:
         explosionDef->radius = 7.5f;
-        // will typically be closer to 45 with projectile velocity
-        // factored in
         explosionDef->impulsePerLength = 10.0f;
         return;
     case MINE_LAUNCHER_WEAPON:

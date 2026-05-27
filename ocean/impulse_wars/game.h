@@ -4,36 +4,30 @@
 #include "helpers.h"
 #include "settings.h"
 #include "types.h"
+#include "fs_compat.h"
 
 // these functions call each other so need to be forward declared
 void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool processExplosions, const bool full);
-void createExplosion(iwEnv *e, droneEntity *drone, const projectileEntity *projectile, const b2ExplosionDef *def);
+void createExplosion(iwEnv *e, droneEntity *drone, const projectileEntity *projectile, const fsVec2 pos, float radius, float magnitude, uint32_t maskBits);
+void handleProjectileEndTouch(iwEnv *e, const entity *sensor, entity *visitor);
 
-void updateTrailPoints(trailPoints *tp, const uint8_t maxLen, const b2Vec2 pos);
+void updateTrailPoints(trailPoints *tp, const uint8_t maxLen, const fsVec2 pos);
 
 entity *createEntity(iwEnv *e, enum entityType type, void *entityData) {
-    int32_t id = b2AllocId(&e->idPool);
-    entity *ent = NULL;
-    if (id == (int64_t)cc_array_size(e->entities)) {
-        ent = fastCalloc(1, sizeof(entity));
-        ent->id = fastCalloc(1, sizeof(entityID));
-        cc_array_add(e->entities, ent);
-    } else {
-        ent = safe_array_get_at(e->entities, id);
-    }
-
+    entity *ent = fastCalloc(1, sizeof(entity));
+    ent->id = fastCalloc(1, sizeof(entityID));
     ent->generation += 1;
     ent->type = type;
     ent->entity = entityData;
-    ent->id->id = id + 1,
+    ent->id->id = cc_array_size(e->entities) + 1;
     ent->id->generation = ent->generation;
-
+    cc_array_add(e->entities, ent);
     return ent;
 }
 
 void destroyEntity(iwEnv *e, entity *ent) {
-    b2FreeId(&e->idPool, ent->id->id - 1);
     ent->id->id = 0;
+    // In a real pool we'd add to freelist
 }
 
 // will return a pointer to an entity or NULL if the given entity ID is
@@ -62,7 +56,7 @@ static inline int16_t cellIndex(const iwEnv *e, const int8_t col, const int8_t r
 
 // discretizes an entity's position into a cell index; -1 is returned if
 // the position is out of bounds of the map
-static inline int16_t entityPosToCellIdx(const iwEnv *e, const b2Vec2 pos) {
+static inline int16_t entityPosToCellIdx(const iwEnv *e, const fsVec2 pos) {
     const float cellX = pos.x + (((float)e->map->columns * WALL_THICKNESS) / 2.0f);
     const float cellY = pos.y + (((float)e->map->rows * WALL_THICKNESS) / 2.0f);
     const int8_t cellCol = cellX / WALL_THICKNESS;
@@ -76,90 +70,37 @@ static inline int16_t entityPosToCellIdx(const iwEnv *e, const b2Vec2 pos) {
     return cellIdx;
 }
 
-typedef struct overlapAABBCtx {
-    bool overlaps;
-} overlapAABBCtx;
-
-bool overlapAABBCallback(b2ShapeId shapeID, void *context) {
-    if (!b2Shape_IsValid(shapeID)) {
-        return true;
-    }
-
-    overlapAABBCtx *ctx = context;
-    ctx->overlaps = true;
-    return true;
-}
-
 // returns true if the given position overlaps with shapes in a bounding
 // box with a height and width of distance
-bool isOverlappingAABB(const iwEnv *e, const b2Vec2 pos, const float distance, const b2QueryFilter filter) {
-    b2AABB bounds = {
-        .lowerBound = {.x = pos.x - distance, .y = pos.y - distance},
-        .upperBound = {.x = pos.x + distance, .y = pos.y + distance},
+bool isOverlappingAABB(const iwEnv *e, const fsVec2 pos, const float distance, const uint32_t categoryBits, const uint32_t maskBits) {
+    fsAABB query = {
+        .min = {.x = pos.x - distance, .y = pos.y - distance},
+        .max = {.x = pos.x + distance, .y = pos.y + distance},
     };
-    overlapAABBCtx ctx = {.overlaps = false};
-    b2World_OverlapAABB(e->worldID, bounds, filter, overlapAABBCallback, &ctx);
-    return ctx.overlaps;
-}
-
-b2ShapeProxy makeDistanceProxy(const entity *ent, bool *isCircle) {
-    b2ShapeProxy proxy = {0};
-    float extent = 0.0f;
-    wallEntity *wall = NULL;
-
-    switch (ent->type) {
-    case DRONE_ENTITY:
-        *isCircle = true;
-        proxy.count = 1;
-        proxy.radius = DRONE_RADIUS;
-        break;
-    case SHIELD_ENTITY:
-        *isCircle = true;
-        proxy.count = 1;
-        proxy.radius = DRONE_SHIELD_RADIUS;
-        break;
-    case PROJECTILE_ENTITY:
-        *isCircle = true;
-        const projectileEntity *proj = ent->entity;
-        proxy.count = 1;
-        proxy.radius = proj->weaponInfo->radius;
-        break;
-    case WEAPON_PICKUP_ENTITY:
-        extent = PICKUP_THICKNESS / 2.0f;
-
-        proxy.count = 4;
-        proxy.points[0] = (b2Vec2){.x = -extent, .y = -extent};
-        proxy.points[1] = (b2Vec2){.x = -extent, .y = +extent};
-        proxy.points[2] = (b2Vec2){.x = +extent, .y = -extent};
-        proxy.points[3] = (b2Vec2){.x = +extent, .y = +extent};
-        break;
-    case STANDARD_WALL_ENTITY:
-    case BOUNCY_WALL_ENTITY:
-    case DEATH_WALL_ENTITY:
-        extent = WALL_THICKNESS;
-        wall = ent->entity;
-        if (wall->isFloating) {
-            extent = FLOATING_WALL_THICKNESS;
+    
+    for (uint16_t i = 0; i < MAX_BODIES; i++) {
+        const fsBody *b = &e->world.bodies[i];
+        if (!b->isActive) continue;
+        if (!(b->categoryBits & maskBits)) continue;
+        
+        // Simple AABB vs Body check
+        if (b->shape.type == FS_CIRCLE) {
+            float r = b->shape.circle.radius;
+            if (b->pos.x + r < query.min.x || b->pos.x - r > query.max.x ||
+                b->pos.y + r < query.min.y || b->pos.y - r > query.max.y) continue;
+            return true;
+        } else if (b->shape.type == FS_BOX) {
+            float hx = b->shape.box.halfExtents.x;
+            float hy = b->shape.box.halfExtents.y;
+            if (b->pos.x + hx < query.min.x || b->pos.x - hx > query.max.x ||
+                b->pos.y + hy < query.min.y || b->pos.y - hy > query.max.y) continue;
+            return true;
         }
-        extent /= 2.0f;
-
-        proxy.count = 4;
-        proxy.points[0] = (b2Vec2){.x = -extent, .y = -extent};
-        proxy.points[1] = (b2Vec2){.x = -extent, .y = +extent};
-        proxy.points[2] = (b2Vec2){.x = +extent, .y = -extent};
-        proxy.points[3] = (b2Vec2){.x = +extent, .y = +extent};
-        break;
-    default:
-        ERRORF("unknown entity type for shape distance: %d", ent->type);
     }
-
-    return proxy;
+    return false;
 }
 
-b2Transform entityTransform(const entity *ent) {
-    b2Transform transform;
-    wallEntity *wall;
-    projectileEntity *proj;
+
     droneEntity *drone;
 
     switch (ent->type) {
@@ -173,12 +114,12 @@ b2Transform entityTransform(const entity *ent) {
     case PROJECTILE_ENTITY:
         proj = ent->entity;
         transform.p = proj->pos;
-        transform.q = b2Rot_identity;
+        transform.q = fsRot_identity;
         return transform;
     case DRONE_ENTITY:
         drone = ent->entity;
         transform.p = drone->pos;
-        transform.q = b2Rot_identity;
+        transform.q = fsRot_identity;
         return transform;
     default:
         ERRORF("unknown entity type: %d", ent->type);
@@ -186,113 +127,85 @@ b2Transform entityTransform(const entity *ent) {
 }
 
 // returns the closest points between two entities
-b2DistanceOutput closestPoint(const entity *srcEnt, const entity *dstEnt) {
-    bool isCircle = false;
-    b2DistanceInput input;
-    input.proxyA = makeDistanceProxy(srcEnt, &isCircle);
-    input.proxyB = makeDistanceProxy(dstEnt, &isCircle);
-    input.transformA = entityTransform(srcEnt);
-    input.transformB = entityTransform(dstEnt);
-    if (input.proxyA.radius != 0.0f && input.proxyB.radius != 0.0f) {
-        b2DistanceOutput output = {0};
-        output.distance = b2Distance(input.transformB.p, input.transformA.p) - input.proxyA.radius - input.proxyB.radius;
-        output.normal = b2Normalize(b2Sub(input.transformB.p, input.transformA.p));
-        output.pointA = b2MulAdd(input.transformA.p, input.proxyA.radius, output.normal);
-        output.pointB = b2MulAdd(input.transformB.p, input.proxyB.radius, output.normal);
-        return output;
+typedef struct {
+    float distance;
+    fsVec2 normal;
+} fsDistanceOutput;
+
+fsDistanceOutput closestPoint(const entity *srcEnt, const entity *dstEnt) {
+    fsVec2 p1 = fsVec2_zero;
+    fsVec2 p2 = fsVec2_zero;
+    float r1 = 0;
+    float r2 = 0;
+
+    switch (srcEnt->type) {
+        case DRONE_ENTITY: p1 = ((droneEntity*)srcEnt->entity)->pos; r1 = DRONE_RADIUS; break;
+        case SHIELD_ENTITY: p1 = ((shieldEntity*)srcEnt->entity)->pos; r1 = DRONE_SHIELD_RADIUS; break;
+        case PROJECTILE_ENTITY: p1 = ((projectileEntity*)srcEnt->entity)->pos; r1 = ((projectileEntity*)srcEnt->entity)->weaponInfo->radius; break;
+        default: break;
     }
 
-    input.useRadii = isCircle;
-
-    b2SimplexCache cache = {0};
-    return b2ShapeDistance(&input, &cache, NULL, 0);
-}
-
-typedef struct behindWallContext {
-    const entity *dstEnt;
-    const enum entityType *targetType;
-    bool hit;
-} behindWallContext;
-
-float posBehindWallCallback(b2ShapeId shapeID, b2Vec2 point, b2Vec2 normal, float fraction, void *context) {
-    // these are unused but required by the b2CastResultFcn callback prototype
-    MAYBE_UNUSED(point);
-    MAYBE_UNUSED(normal);
-    MAYBE_UNUSED(fraction);
-
-    behindWallContext *ctx = context;
-    const entity *ent = b2Shape_GetUserData(shapeID);
-    if (ent == ctx->dstEnt || (ctx->targetType != NULL && ent->type == *ctx->targetType)) {
-        return -1;
+    switch (dstEnt->type) {
+        case DRONE_ENTITY: p2 = ((droneEntity*)dstEnt->entity)->pos; r2 = DRONE_RADIUS; break;
+        case SHIELD_ENTITY: p2 = ((shieldEntity*)dstEnt->entity)->pos; r2 = DRONE_SHIELD_RADIUS; break;
+        case PROJECTILE_ENTITY: p2 = ((projectileEntity*)dstEnt->entity)->pos; r2 = ((projectileEntity*)dstEnt->entity)->weaponInfo->radius; break;
+        case STANDARD_WALL_ENTITY:
+        case BOUNCY_WALL_ENTITY:
+        case DEATH_WALL_ENTITY: p2 = ((wallEntity*)dstEnt->entity)->pos; r2 = 1.0f; break; // Approximation
+        default: break;
     }
-    ctx->hit = true;
-    return 0;
+
+    fsDistanceOutput output;
+    fsVec2 delta = fsSub(p2, p1);
+    float distSq = fsLengthSq(delta);
+    if (distSq < 0.0001f) {
+        output.distance = 0;
+        output.normal = (fsVec2){0, 1};
+    } else {
+        float dist = sqrtf(distSq);
+        output.distance = dist - r1 - r2;
+        output.normal = fsMul(delta, 1.0f/dist);
+    }
+    return output;
 }
 
 // returns true if there are shapes that match filter between startPos and endPos
-bool posBehindWall(const iwEnv *e, const b2Vec2 srcPos, const b2Vec2 dstPos, const entity *dstEnt, const b2QueryFilter filter, const enum entityType *targetType) {
-    const float rayDistance = b2Distance(srcPos, dstPos);
-    // if the two points are extremely close we can safely assume the
-    // entity isn't behind a wall
+bool posBehindWall(const iwEnv *e, const fsVec2 srcPos, const fsVec2 dstPos, const entity *dstEnt, const uint32_t categoryBits, const uint32_t maskBits, const enum entityType *targetType) {
+    const float rayDistance = fsLength(fsSub(dstPos, srcPos));
     if (rayDistance <= 1.0f) {
         return false;
     }
 
-    const b2Vec2 translation = b2Sub(dstPos, srcPos);
-    behindWallContext ctx = {
-        .dstEnt = dstEnt,
-        .targetType = targetType,
-        .hit = false,
-    };
-    b2World_CastRay(e->worldID, srcPos, translation, filter, posBehindWallCallback, &ctx);
-    return ctx.hit;
-}
-
-typedef struct overlapCircleCtx {
-    const iwEnv *e;
-    const entity *ent;
-    const enum entityType *targetType;
-    const b2QueryFilter filter;
-    bool overlaps;
-} overlapCircleCtx;
-
-bool isOverlappingCircleCallback(b2ShapeId shapeID, void *context) {
-    if (!b2Shape_IsValid(shapeID)) {
+    fsVec2 dir = fsSub(dstPos, srcPos);
+    fsRayCastResult res;
+    if (fsRayCast((fsWorld*)&e->world, srcPos, dir, 1.0f, maskBits, &res)) {
+        if (res.body->userData == dstEnt) return false;
+        if (targetType != NULL) {
+            entity *hitEnt = res.body->userData;
+            if (hitEnt->type == *targetType) return false;
+        }
         return true;
     }
-
-    overlapCircleCtx *ctx = context;
-    const entity *overlappingEnt = b2Shape_GetUserData(shapeID);
-    if (ctx->targetType != NULL && overlappingEnt->type != *ctx->targetType) {
-        return true;
-    }
-
-    const b2DistanceOutput output = closestPoint(ctx->ent, overlappingEnt);
-    const bool behind = posBehindWall(ctx->e, output.pointA, output.pointB, ctx->ent, ctx->filter, ctx->targetType);
-    if (!behind) {
-        ctx->overlaps = true;
-    } else if (ctx->ent->type == PROJECTILE_ENTITY) {
-        projectileEntity *proj = ctx->ent->entity;
-        droneEntity *drone = overlappingEnt->entity;
-        proj->dronesBehindWalls[proj->numDronesBehindWalls++] = drone->idx;
-    }
-    return behind;
+    return false;
 }
 
-bool isOverlappingCircleInLineOfSight(const iwEnv *e, const entity *ent, const b2Vec2 startPos, const float radius, const b2QueryFilter filter, const enum entityType *targetType) {
-    const b2ShapeProxy cirProxy = b2MakeProxy(&startPos, 1, radius);
-    overlapCircleCtx ctx = {
-        .e = e,
-        .ent = ent,
-        .targetType = targetType,
-        .filter = (b2QueryFilter){
-            .categoryBits = filter.categoryBits,
-            .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE,
-        },
-        .overlaps = false,
-    };
-    b2World_OverlapShape(e->worldID, &cirProxy, filter, isOverlappingCircleCallback, &ctx);
-    return ctx.overlaps;
+bool isOverlappingCircleInLineOfSight(const iwEnv *e, const entity *ent, const fsVec2 startPos, const float radius, const uint32_t categoryBits, const uint32_t maskBits, const enum entityType *targetType) {
+    for (uint16_t i = 0; i < MAX_BODIES; i++) {
+        fsBody *b = (fsBody*)&e->world.bodies[i];
+        if (!b->isActive) continue;
+        if (!(b->categoryBits & maskBits)) continue;
+        if (targetType != NULL && ((entity*)b->userData)->type != *targetType) continue;
+
+        float dist = fsLength(fsSub(b->pos, startPos));
+        float combinedRadius = radius + (b->shape.type == FS_CIRCLE ? b->shape.circle.radius : 0.0f); // simplified
+        if (dist < combinedRadius) {
+            // Check line of sight
+            if (!posBehindWall(e, startPos, b->pos, ent, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, targetType)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 uint8_t cellOffsets[8][2] = {
@@ -311,7 +224,7 @@ uint8_t cellOffsets[8][2] = {
 // if quad is set to -1 a random valid position from anywhere on the map
 // will be returned, otherwise a position within the specified quadrant
 // will be returned
-bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, b2Vec2 *emptyPos, int8_t quad) {
+bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, fsVec2 *emptyPos, int8_t quad) {
     uint8_t checkedCells[BITNSLOTS(MAX_CELLS)] = {0};
     const size_t nCells = cc_array_size(e->cells) - 1;
     uint16_t attempts = 0;
@@ -343,7 +256,7 @@ bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, b2Vec2 *emptyPos,
             const float maxX = e->map->spawnQuads[quad].max.x;
             const float maxY = e->map->spawnQuads[quad].max.y;
 
-            b2Vec2 randPos = {.x = randFloat(&e->randState, minX, maxX), .y = randFloat(&e->randState, minY, maxY)};
+            fsVec2 randPos = {.x = randFloat(&e->randState, minX, maxX), .y = randFloat(&e->randState, minY, maxY)};
             cellIdx = entityPosToCellIdx(e, randPos);
         }
         if (bitTest(checkedCells, cellIdx)) {
@@ -363,7 +276,7 @@ bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, b2Vec2 *emptyPos,
             // ensure pickups don't spawn too close to other pickups
             for (uint8_t i = 0; i < cc_array_size(e->pickups); i++) {
                 const weaponPickupEntity *pickup = safe_array_get_at(e->pickups, i);
-                if (b2DistanceSquared(cell->pos, pickup->pos) < PICKUP_SPAWN_DISTANCE_SQUARED) {
+                if (fsDistanceSq(cell->pos, pickup->pos) < PICKUP_SPAWN_DISTANCE_SQUARED) {
                     tooClose = true;
                     break;
                 }
@@ -406,7 +319,7 @@ bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, b2Vec2 *emptyPos,
                     if (drone->dead) {
                         continue;
                     }
-                    if (b2DistanceSquared(cell->pos, drone->pos) == 0.0f) {
+                    if (fsDistanceSq(cell->pos, drone->pos) == 0.0f) {
                         tooClose = true;
                         break;
                     }
@@ -425,7 +338,7 @@ bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, b2Vec2 *emptyPos,
                     if (drone->dead) {
                         continue;
                     }
-                    if (b2DistanceSquared(cell->pos, drone->pos) < DRONE_DRONE_SPAWN_DISTANCE_SQUARED) {
+                    if (fsDistanceSq(cell->pos, drone->pos) < DRONE_DRONE_SPAWN_DISTANCE_SQUARED) {
                         tooClose = true;
                         break;
                     }
@@ -439,61 +352,42 @@ bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, b2Vec2 *emptyPos,
             break;
         }
 
-        uint64_t maskBits = FLOATING_WALL_SHAPE | WEAPON_PICKUP_SHAPE | DRONE_SHAPE;
+        uint32_t maskBits = FLOATING_WALL_SHAPE | WEAPON_PICKUP_SHAPE | DRONE_SHAPE;
         if (shapeType != FLOATING_WALL_SHAPE && !laxDroneDistanceChecks) {
             maskBits &= ~shapeType;
         }
-        const b2QueryFilter filter = {
-            .categoryBits = shapeType,
-            .maskBits = maskBits,
-        };
-        if (!isOverlappingAABB(e, cell->pos, minSpawnDistance, filter)) {
+
+        if (!isOverlappingAABB(e, cell->pos, minSpawnDistance, shapeType, maskBits)) {
             *emptyPos = cell->pos;
             return true;
         }
     }
 }
 
-entity *createWall(iwEnv *e, const b2Vec2 pos, const float width, const float height, int16_t cellIdx, const enum entityType type, const bool floating) {
+entity *createWall(iwEnv *e, const fsVec2 pos, const float width, const float height, int16_t cellIdx, const enum entityType type, const bool floating) {
     ASSERT(cellIdx != -1);
     ASSERT(entityTypeIsWall(type));
 
-    b2BodyDef wallBodyDef = b2DefaultBodyDef();
-    wallBodyDef.position = pos;
+    fsBody *b = fsWorld_CreateBody(&e->world);
+    b->pos = pos;
+    b->isStatic = !floating;
+    b->friction = STANDARD_WALL_FRICTION;
+    b->restitution = (type == BOUNCY_WALL_ENTITY) ? BOUNCY_WALL_RESTITUTION : STANDARD_WALL_RESTITUTION;
+    b->categoryBits = floating ? FLOATING_WALL_SHAPE : WALL_SHAPE;
+    b->maskBits = FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE | DRONE_PIECE_SHAPE;
     if (floating) {
-        wallBodyDef.type = b2_dynamicBody;
-        wallBodyDef.linearDamping = FLOATING_WALL_DAMPING;
-        wallBodyDef.angularDamping = FLOATING_WALL_DAMPING;
-        wallBodyDef.isAwake = false;
-    }
-    b2BodyId wallBodyID = b2CreateBody(e->worldID, &wallBodyDef);
-
-    b2Vec2 extent = {.x = width / 2.0f, .y = height / 2.0f};
-    b2ShapeDef wallShapeDef = b2DefaultShapeDef();
-    wallShapeDef.invokeContactCreation = false;
-    wallShapeDef.density = WALL_DENSITY;
-    wallShapeDef.material.restitution = STANDARD_WALL_RESTITUTION;
-    wallShapeDef.material.friction = STANDARD_WALL_FRICTION;
-    wallShapeDef.filter.categoryBits = WALL_SHAPE;
-    wallShapeDef.filter.maskBits = FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE | DRONE_PIECE_SHAPE;
-    if (floating) {
-        wallShapeDef.filter.categoryBits = FLOATING_WALL_SHAPE;
-        wallShapeDef.filter.maskBits |= WALL_SHAPE | WEAPON_PICKUP_SHAPE;
-        wallShapeDef.enableSensorEvents = true;
+        b->maskBits |= WALL_SHAPE | WEAPON_PICKUP_SHAPE;
     }
 
-    if (type == BOUNCY_WALL_ENTITY) {
-        wallShapeDef.material.restitution = BOUNCY_WALL_RESTITUTION;
-        wallShapeDef.material.friction = 0.0f;
-    } else if (type == DEATH_WALL_ENTITY) {
-        wallShapeDef.enableContactEvents = true;
-    }
+    fsVec2 extent = {.x = width / 2.0f, .y = height / 2.0f};
+    b->shape.type = FS_BOX;
+    b->shape.box.halfExtents = extent;
 
     wallEntity *wall = fastCalloc(1, sizeof(wallEntity));
-    wall->bodyID = wallBodyID;
+    wall->body = b;
     wall->pos = pos;
-    wall->rot = b2Rot_identity;
-    wall->velocity = b2Vec2_zero;
+    wall->rot = fsRot_identity;
+    wall->velocity = fsVec2_zero;
     wall->extent = extent;
     wall->mapCellIdx = cellIdx;
     wall->isFloating = floating;
@@ -502,15 +396,11 @@ entity *createWall(iwEnv *e, const b2Vec2 pos, const float width, const float he
 
     entity *ent = createEntity(e, type, wall);
     wall->ent = ent;
-
-    wallShapeDef.userData = ent;
-    const b2Polygon wallPolygon = b2MakeBox(extent.x, extent.y);
-    wall->shapeID = b2CreatePolygonShape(wallBodyID, &wallShapeDef, &wallPolygon);
-    b2Body_SetUserData(wall->bodyID, ent);
+    b->userData = ent;
 
     if (floating) {
         cc_array_add(e->floatingWalls, wall);
-        create_array(&wall->physicsTracking, 16);
+        memset(wall->contributions, 0, _MAX_DRONES * sizeof(fsVec2));
     } else {
         cc_array_add(e->walls, wall);
     }
@@ -527,14 +417,12 @@ void destroyWall(iwEnv *e, wallEntity *wall, const bool full) {
     }
 
     if (wall->isFloating) {
-        for (size_t i = 0; i < cc_array_size(wall->physicsTracking); i++) {
-            physicsStepInfo *physicsStep = safe_array_get_at(wall->physicsTracking, i);
-            fastFree(physicsStep);
+        for (int i = 0; i < _MAX_DRONES; i++) {
+            wall->contributions[i] = fsVec2_zero;
         }
-        cc_array_destroy(wall->physicsTracking);
     }
 
-    b2DestroyBody(wall->bodyID);
+    fsWorld_DestroyBody(wall->body);
     fastFree(wall);
 }
 
@@ -573,24 +461,21 @@ enum weaponType randWeaponPickupType(iwEnv *e) {
 void createWeaponPickupBodyShape(const iwEnv *e, weaponPickupEntity *pickup) {
     pickup->bodyDestroyed = false;
 
-    b2BodyDef pickupBodyDef = b2DefaultBodyDef();
-    pickupBodyDef.position = pickup->pos;
-    pickupBodyDef.userData = pickup->ent;
-    pickup->bodyID = b2CreateBody(e->worldID, &pickupBodyDef);
-
-    b2ShapeDef pickupShapeDef = b2DefaultShapeDef();
-    pickupShapeDef.filter.categoryBits = WEAPON_PICKUP_SHAPE;
-    pickupShapeDef.filter.maskBits = FLOATING_WALL_SHAPE | DRONE_SHAPE;
-    pickupShapeDef.isSensor = true;
-    pickupShapeDef.enableSensorEvents = true;
-    pickupShapeDef.userData = pickup->ent;
-    const b2Polygon pickupPolygon = b2MakeBox(PICKUP_THICKNESS / 2.0f, PICKUP_THICKNESS / 2.0f);
-    pickup->shapeID = b2CreatePolygonShape(pickup->bodyID, &pickupShapeDef, &pickupPolygon);
+    fsBody *b = fsWorld_CreateBody((fsWorld*)&e->world);
+    b->pos = pickup->pos;
+    b->isStatic = true;
+    b->isSensor = true;
+    b->categoryBits = WEAPON_PICKUP_SHAPE;
+    b->maskBits = FLOATING_WALL_SHAPE | DRONE_SHAPE;
+    b->userData = pickup->ent;
+    b->shape.type = FS_BOX;
+    b->shape.box.halfExtents = (fsVec2){PICKUP_THICKNESS / 2.0f, PICKUP_THICKNESS / 2.0f};
+    pickup->body = b;
 }
 
 void createWeaponPickup(iwEnv *e) {
     // ensure weapon pickups are initially spawned somewhat uniformly
-    b2Vec2 pos;
+    fsVec2 pos;
     e->lastSpawnQuad = (e->lastSpawnQuad + 1) % 4;
     if (!findOpenPos(e, WEAPON_PICKUP_SHAPE, &pos, e->lastSpawnQuad)) {
         ERROR("no open position for weapon pickup");
@@ -625,7 +510,7 @@ void destroyWeaponPickup(iwEnv *e, weaponPickupEntity *pickup) {
     cell->ent = NULL;
 
     if (!pickup->bodyDestroyed) {
-        b2DestroyBody(pickup->bodyID);
+        fsWorld_DestroyBody(pickup->body);
     }
 
     fastFree(pickup);
@@ -643,7 +528,7 @@ void disableWeaponPickup(iwEnv *e, weaponPickupEntity *pickup) {
     if (e->suddenDeathWallsPlaced) {
         pickup->respawnWait = SUDDEN_DEATH_PICKUP_RESPAWN_WAIT;
     }
-    b2DestroyBody(pickup->bodyID);
+    fsWorld_DestroyBody(pickup->body);
     pickup->bodyDestroyed = true;
 
     mapCell *cell = safe_array_get_at(e->cells, pickup->mapCellIdx);
@@ -654,38 +539,21 @@ void disableWeaponPickup(iwEnv *e, weaponPickupEntity *pickup) {
 }
 
 void createDroneShield(iwEnv *e, droneEntity *drone, const int8_t groupIdx) {
-    // the shield is comprised of 2 shapes over 2 bodies:
-    // 1. a kinematic body that allows the parent drone to be unaffected
-    // by collisions since kinematic bodies have essentially infinite mass
-    // 2. a shape on the drone body that collides with walls and other
-    // shields, since kinematic bodies don't collide with other kinematic
-    // bodies or static bodies
-
-    b2BodyDef shieldBodyDef = b2DefaultBodyDef();
-    shieldBodyDef.type = b2_kinematicBody;
-    shieldBodyDef.motionLocks = (b2MotionLocks){.angularZ = true};
-    shieldBodyDef.position = drone->pos;
-    b2BodyId shieldBodyID = b2CreateBody(e->worldID, &shieldBodyDef);
-
-    b2ShapeDef shieldShapeDef = b2DefaultShapeDef();
-    shieldShapeDef.filter.categoryBits = SHIELD_SHAPE;
-    shieldShapeDef.filter.maskBits = PROJECTILE_SHAPE | DRONE_SHAPE;
-    shieldShapeDef.filter.groupIndex = groupIdx;
-    shieldShapeDef.enableContactEvents = true;
-
-    b2ShapeDef shieldBufferShapeDef = b2DefaultShapeDef();
-    shieldBufferShapeDef.density = 0.0f;
-    shieldBufferShapeDef.material.friction = DRONE_FRICTION;
-    shieldBufferShapeDef.material.restitution = DRONE_RESTITUTION;
-    shieldBufferShapeDef.filter.categoryBits = SHIELD_SHAPE;
-    shieldBufferShapeDef.filter.maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | SHIELD_SHAPE;
-    shieldBufferShapeDef.filter.groupIndex = groupIdx;
+    fsBody *b = fsWorld_CreateBody(&e->world);
+    b->pos = drone->pos;
+    b->isStatic = false; // It follows the drone, but for now let's just make it a body.
+    // In Impulse Wars, the shield is kinematic and follows the drone.
+    // I'll need to manually update its position in the step.
+    b->categoryBits = SHIELD_SHAPE;
+    b->maskBits = PROJECTILE_SHAPE | DRONE_SHAPE | WALL_SHAPE | FLOATING_WALL_SHAPE | SHIELD_SHAPE;
+    b->shape.type = FS_CIRCLE;
+    b->shape.circle.radius = DRONE_SHIELD_RADIUS;
 
     shieldEntity *shield = fastCalloc(1, sizeof(shieldEntity));
     shield->drone = drone;
-    shield->bodyID = shieldBodyID;
+    shield->body = b;
     shield->pos = drone->pos;
-    shield->health = DRONE_SHIELD_HEALTH;
+    shield->health = DRONE_SHIELD_MAX_HEALTH;
     float duration = DRONE_SHIELD_START_DURATION;
     if (drone->livesLeft != DRONE_LIVES) {
         duration = DRONE_SHIELD_RESPAWN_DURATION;
@@ -694,29 +562,15 @@ void createDroneShield(iwEnv *e, droneEntity *drone, const int8_t groupIdx) {
 
     entity *ent = createEntity(e, SHIELD_ENTITY, shield);
     shield->ent = ent;
-
-    shieldShapeDef.userData = ent;
-    const b2Circle shieldCircle = {.center = b2Vec2_zero, .radius = DRONE_SHIELD_RADIUS};
-    shield->shapeID = b2CreateCircleShape(shieldBodyID, &shieldShapeDef, &shieldCircle);
-    b2Body_SetUserData(shield->bodyID, ent);
-
-    shieldBufferShapeDef.userData = ent;
-    shield->bufferShapeID = b2CreateCircleShape(drone->bodyID, &shieldBufferShapeDef, &shieldCircle);
+    b->userData = ent;
 
     drone->shield = shield;
 }
 
 void createDrone(iwEnv *e, const uint8_t idx) {
-    const int8_t groupIdx = -(idx + 1);
-    b2BodyDef droneBodyDef = b2DefaultBodyDef();
-    droneBodyDef.type = b2_dynamicBody;
-
+    fsVec2 spawnPos;
     int8_t spawnQuad = -1;
     if (!e->isTraining) {
-        // spawn drones in diagonal quadrants from each other so that
-        // they're more likely to be further apart if we're not training;
-        // doing this while training will result in much slower learning
-        // due to drones starting much farther apart
         if (e->lastSpawnQuad == -1) {
             spawnQuad = randInt(&e->randState, 0, 3);
         } else if (e->numDrones == 2) {
@@ -726,26 +580,23 @@ void createDrone(iwEnv *e, const uint8_t idx) {
         }
         e->lastSpawnQuad = spawnQuad;
     }
-    if (!findOpenPos(e, DRONE_SHAPE, &droneBodyDef.position, spawnQuad)) {
+    if (!findOpenPos(e, DRONE_SHAPE, &spawnPos, spawnQuad)) {
         ERROR("no open position for drone");
     }
 
-    droneBodyDef.motionLocks = (b2MotionLocks){.angularZ = true};
-    droneBodyDef.linearDamping = DRONE_LINEAR_DAMPING;
-    b2BodyId droneBodyID = b2CreateBody(e->worldID, &droneBodyDef);
-    b2ShapeDef droneShapeDef = b2DefaultShapeDef();
-    droneShapeDef.density = DRONE_DENSITY;
-    droneShapeDef.material.friction = DRONE_FRICTION;
-    droneShapeDef.material.restitution = DRONE_RESTITUTION;
-    droneShapeDef.filter.categoryBits = DRONE_SHAPE;
-    droneShapeDef.filter.maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | WEAPON_PICKUP_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE;
-    droneShapeDef.filter.groupIndex = groupIdx;
-    droneShapeDef.enableContactEvents = true;
-    droneShapeDef.enableSensorEvents = true;
-    const b2Circle droneCircle = {.center = b2Vec2_zero, .radius = DRONE_RADIUS};
+    fsBody *b = fsWorld_CreateBody(&e->world);
+    b->pos = spawnPos;
+    b->isStatic = false;
+    b->friction = DRONE_FRICTION;
+    b->restitution = DRONE_RESTITUTION;
+    b->invMass = DRONE_INV_MASS;
+    b->categoryBits = DRONE_SHAPE;
+    b->maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | WEAPON_PICKUP_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE;
+    b->shape.type = FS_CIRCLE;
+    b->shape.circle.radius = DRONE_RADIUS;
 
     droneEntity *drone = fastCalloc(1, sizeof(droneEntity));
-    drone->bodyID = droneBodyID;
+    drone->body = b;
     drone->weaponInfo = e->defaultWeapon;
     drone->ammo = weaponAmmo(e->defaultWeapon->type, drone->weaponInfo->type);
     drone->energyLeft = DRONE_ENERGY_MAX;
@@ -754,27 +605,23 @@ void createDrone(iwEnv *e, const uint8_t idx) {
     if (e->teamsEnabled) {
         drone->team = idx / (e->numDrones / 2);
     }
-    drone->initalPos = droneBodyDef.position;
-    drone->pos = droneBodyDef.position;
-    drone->mapCellIdx = entityPosToCellIdx(e, droneBodyDef.position);
-    drone->lastAim = (b2Vec2){.x = 0.0f, .y = -1.0f};
+    drone->initalPos = spawnPos;
+    drone->pos = spawnPos;
+    drone->mapCellIdx = entityPosToCellIdx(e, spawnPos);
+    drone->lastAim = (fsVec2){.x = 0.0f, .y = -1.0f};
     drone->livesLeft = DRONE_LIVES;
     create_array(&drone->brakeTrailPoints, 64);
     drone->respawnGuideLifetime = UINT16_MAX;
     memset(&drone->stepInfo, 0x0, sizeof(droneStepInfo));
-    create_array(&drone->physicsTracking, 128);
     drone->killedBy = -1;
 
     entity *ent = createEntity(e, DRONE_ENTITY, drone);
     drone->ent = ent;
-
-    droneShapeDef.userData = ent;
-    drone->shapeID = b2CreateCircleShape(droneBodyID, &droneShapeDef, &droneCircle);
-    b2Body_SetUserData(drone->bodyID, ent);
+    b->userData = ent;
 
     cc_array_add(e->drones, drone);
 
-    createDroneShield(e, drone, groupIdx);
+    createDroneShield(e, drone, -(idx + 1));
 }
 
 void droneAddEnergy(droneEntity *drone, float energy) {
@@ -788,63 +635,52 @@ void droneAddEnergy(droneEntity *drone, float energy) {
 
 void createDronePiece(iwEnv *e, droneEntity *drone, const bool fromShield) {
     const float distance = randFloat(&e->randState, DRONE_PIECE_MIN_DISTANCE, DRONE_PIECE_MAX_DISTANCE);
-    const b2Vec2 direction = {.x = randFloat(&e->randState, -1.0f, 1.0f), .y = randFloat(&e->randState, -1.0f, 1.0f)};
-    const b2Vec2 pos = b2MulAdd(drone->pos, distance, direction);
-    const b2Rot rot = b2MakeRot(randFloat(&e->randState, -PI, PI));
+    const fsVec2 direction = fsNormalize((fsVec2){.x = randFloat(&e->randState, -1.0f, 1.0f), .y = randFloat(&e->randState, -1.0f, 1.0f)});
+    const fsVec2 pos = fsAdd(drone->pos, fsMul(direction, distance));
+    const float angle = randFloat(&e->randState, -PI, PI);
 
-    dronePieceEntity *piece = fastCalloc(1, sizeof(dronePieceEntity));
+    dronePieceEntity *piece;
+    if (cc_array_size(e->dronePiecePool) > 0) {
+        cc_array_remove_last(e->dronePiecePool, (void **)&piece);
+        memset(piece, 0, sizeof(dronePieceEntity));
+    } else {
+        piece = fastCalloc(1, sizeof(dronePieceEntity));
+    }
+
+    fsBody *b = fsWorld_CreateBody(&e->world);
+    b->pos = pos;
+    b->angle = angle;
+    b->isStatic = false;
+    b->invMass = 1.0f; // Unit mass for pieces
+    
+    const float bonus = 1.0f + min(fsLength(drone->velocity) / 15.0f, 5.0f);
+    const float speed = randFloat(&e->randState, DRONE_PIECE_MIN_SPEED, DRONE_PIECE_MAX_SPEED) * bonus;
+    b->vel = fsMul(direction, speed);
+    
+    b->categoryBits = DRONE_PIECE_SHAPE;
+    b->maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | DRONE_PIECE_SHAPE;
+    b->shape.type = FS_CIRCLE;
+    b->shape.circle.radius = fromShield ? 0.2f : 0.4f;
+
     piece->droneIdx = drone->idx;
     piece->pos = pos;
-    piece->rot = rot;
+    piece->rot = fsMakeRot(angle);
     piece->isShieldPiece = fromShield;
-    piece->lifetime = UINT16_MAX;
+    piece->lifetime = randInt(&e->randState, 5 * e->frameRate, 10 * e->frameRate);
+    piece->body = b;
 
     entity *ent = createEntity(e, DRONE_PIECE_ENTITY, piece);
     piece->ent = ent;
-
-    b2BodyDef pieceBodyDef = b2DefaultBodyDef();
-    pieceBodyDef.type = b2_dynamicBody;
-
-    pieceBodyDef.position = pos;
-    pieceBodyDef.rotation = rot;
-    pieceBodyDef.linearDamping = DRONE_PIECE_LINEAR_DAMPING;
-    pieceBodyDef.angularDamping = DRONE_PIECE_ANGULAR_DAMPING;
-    const float bonus = 1.0f + min(b2Length(drone->velocity) / 15.0f, 5.0f);
-    const float speed = randFloat(&e->randState, DRONE_PIECE_MIN_SPEED, DRONE_PIECE_MAX_SPEED) * bonus;
-    pieceBodyDef.linearVelocity = b2MulSV(speed, direction);
-    pieceBodyDef.angularVelocity = randFloat(&e->randState, -PI, PI);
-    pieceBodyDef.userData = ent;
-    piece->bodyID = b2CreateBody(e->worldID, &pieceBodyDef);
-
-    b2ShapeDef pieceShapeDef = b2DefaultShapeDef();
-    pieceShapeDef.filter.categoryBits = DRONE_PIECE_SHAPE;
-    pieceShapeDef.filter.maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | DRONE_PIECE_SHAPE;
-    pieceShapeDef.density = 1.0f;
-    pieceShapeDef.material.friction = 0.5f;
-    pieceShapeDef.userData = ent;
-
-    // make pieces from the shield a bit smaller
-    if (fromShield) {
-        piece->vertices[0] = (b2Vec2){.x = 0.0f, .y = -1.0f};
-        piece->vertices[1] = (b2Vec2){.x = -0.5f, .y = 0.0f};
-        piece->vertices[2] = (b2Vec2){.x = 0.5f, .y = 0.0f};
-    } else {
-        piece->vertices[0] = (b2Vec2){.x = 0.0f, .y = -1.5f};
-        piece->vertices[1] = (b2Vec2){.x = -0.75f, .y = 0.0f};
-        piece->vertices[2] = (b2Vec2){.x = 0.75f, .y = 0.0f};
-    }
-
-    const b2Hull pieceHull = b2ComputeHull(piece->vertices, 3);
-    const b2Polygon piecePolygon = b2MakePolygon(&pieceHull, 0.0f);
-    piece->shapeID = b2CreatePolygonShape(piece->bodyID, &pieceShapeDef, &piecePolygon);
+    b->userData = ent;
 
     cc_array_add(e->dronePieces, piece);
 }
 
+
 void destroyDronePiece(iwEnv *e, dronePieceEntity *piece) {
-    b2DestroyBody(piece->bodyID);
+    fsWorld_DestroyBody(piece->body);
     destroyEntity(e, piece->ent);
-    fastFree(piece);
+    cc_array_add(e->dronePiecePool, piece);
 }
 
 void destroyDroneShield(iwEnv *e, shieldEntity *shield, const bool createPieces) {
@@ -856,8 +692,7 @@ void destroyDroneShield(iwEnv *e, shieldEntity *shield, const bool createPieces)
     drone->shield = NULL;
     e->stats[drone->idx].ownShieldBroken++;
 
-    b2DestroyBody(shield->bodyID);
-    b2DestroyShape(shield->bufferShapeID, false);
+    fsWorld_DestroyBody(shield->body);
     destroyEntity(e, shield->ent);
     fastFree(shield);
 
@@ -874,14 +709,12 @@ void destroyDroneShield(iwEnv *e, shieldEntity *shield, const bool createPieces)
 void destroyDrone(iwEnv *e, droneEntity *drone) {
     for (size_t i = 0; i < cc_array_size(drone->brakeTrailPoints); i++) {
         brakeTrailPoint *trailPoint = safe_array_get_at(drone->brakeTrailPoints, i);
-        fastFree(trailPoint);
+        cc_array_add(e->brakeTrailPointPool, trailPoint);
     }
     cc_array_destroy(drone->brakeTrailPoints);
-    for (size_t i = 0; i < cc_array_size(drone->physicsTracking); i++) {
-        physicsStepInfo *physicsStep = safe_array_get_at(drone->physicsTracking, i);
-        fastFree(physicsStep);
+    for (int i = 0; i < _MAX_DRONES; i++) {
+        drone->contributions[i] = fsVec2_zero;
     }
-    cc_array_destroy(drone->physicsTracking);
 
     destroyEntity(e, drone->ent);
 
@@ -890,39 +723,13 @@ void destroyDrone(iwEnv *e, droneEntity *drone) {
         destroyDroneShield(e, shield, false);
     }
 
-    b2DestroyBody(drone->bodyID);
+    fsWorld_DestroyBody(drone->body);
     fastFree(drone);
 }
 
-void applyTrackedForce(const iwEnv *e, const b2BodyId bodyID, CC_Array *physicsTracking, const b2Vec2 force, const uint8_t srcIdx) {
-    b2Body_ApplyForceToCenter(bodyID, force, true);
 
-    physicsStepInfo *physicsStep = fastCalloc(1, sizeof(physicsStepInfo));
-    physicsStep->srcIdx = srcIdx;
-    physicsStep->force = force;
-    physicsStep->step = e->episodeLength;
-    cc_array_add(physicsTracking, physicsStep);
-}
 
-void trackImpulse(const iwEnv *e, CC_Array *physicsTracking, const b2Vec2 impulse, const uint8_t srcIdx) {
-    physicsStepInfo *physicsStep = fastCalloc(1, sizeof(physicsStepInfo));
-    physicsStep->srcIdx = srcIdx;
-    physicsStep->impulse = impulse;
-    physicsStep->step = e->episodeLength;
-    cc_array_add(physicsTracking, physicsStep);
-}
 
-void applyTrackedImpulse(const iwEnv *e, const b2BodyId bodyID, CC_Array *physicsTracking, const b2Vec2 impulse, const uint8_t srcIdx) {
-    b2Body_ApplyLinearImpulseToCenter(bodyID, impulse, true);
-    trackImpulse(e, physicsTracking, impulse, srcIdx);
-}
-
-void droneTrackBrake(const iwEnv *e, const droneEntity *drone) {
-    physicsStepInfo *physicsStep = fastCalloc(1, sizeof(physicsStepInfo));
-    physicsStep->brakeToggled = true;
-    physicsStep->step = e->episodeLength;
-    cc_array_add(drone->physicsTracking, physicsStep);
-}
 
 void droneChangeWeapon(const iwEnv *e, droneEntity *drone, const enum weaponType newWeapon) {
     // top up ammo but change nothing else if the weapon is the same
@@ -935,89 +742,62 @@ void droneChangeWeapon(const iwEnv *e, droneEntity *drone, const enum weaponType
     drone->ammo = weaponAmmo(e->defaultWeapon->type, drone->weaponInfo->type);
 }
 
-int8_t findBiggestContributor(iwEnv *e, const enum entityType type, const CC_Array *physicsTracking, const b2Vec2 lastVelocity, float *maxMoveContrib) {
-    b2Vec2 contrib[e->numDrones];
-    memset(contrib, 0x0, e->numDrones * sizeof(b2Vec2));
-    uint16_t step = 0;
-    bool braking = false;
-    float defaultDamping = DRONE_LINEAR_DAMPING;
-    if (type != DRONE_ENTITY) {
-        defaultDamping = FLOATING_WALL_DAMPING;
-    }
-    float droneDamping = DRONE_LINEAR_DAMPING;
 
-    // calculate the contribution of forces and impulses of each drone
-    for (size_t i = 0; i < cc_array_size(physicsTracking); i++) {
-        physicsStepInfo *physicsStep = safe_array_get_at(physicsTracking, i);
-        // if the step has changed, apply damping to contributions
-        if (physicsStep->step != step) {
-            const uint16_t stepDiff = physicsStep->step - step;
-            const float damp = 1.0f / (1.0f + (droneDamping * (e->deltaTime * stepDiff)));
-            for (uint8_t k = 0; k < e->numDrones; k++) {
-                contrib[k] = b2MulSV(damp, contrib[k]);
-            }
+void applyTrackedForce(const iwEnv *e, fsBody *b, fsVec2 *contributions, const fsVec2 force, const uint8_t srcIdx) {
+    const fsVec2 accel = fsMul(force, b->invMass);
+    b->vel = fsAdd(b->vel, fsMul(accel, e->deltaTime));
+    contributions[srcIdx] = fsAdd(contributions[srcIdx], fsMul(accel, e->deltaTime));
+}
 
-            step = physicsStep->step;
-        }
+void applyTrackedImpulse(const iwEnv *e, fsBody *b, fsVec2 *contributions, const fsVec2 impulse, const uint8_t srcIdx) {
+    const fsVec2 accel = fsMul(impulse, b->invMass);
+    b->vel = fsAdd(b->vel, accel);
+    contributions[srcIdx] = fsAdd(contributions[srcIdx], accel);
+}
 
-        if (physicsStep->brakeToggled) {
-            braking = !braking;
-            if (braking) {
-                droneDamping = DRONE_BRAKE_DAMPING_COEF;
-            } else {
-                droneDamping = defaultDamping;
-            }
-        }
+void trackImpulse(const iwEnv *e, fsVec2 *contributions, const fsVec2 impulse, const uint8_t srcIdx) {
+    contributions[srcIdx] = fsAdd(contributions[srcIdx], fsMul(impulse, DRONE_INV_MASS));
+}
 
-        const b2Vec2 invForce = b2MulSV(DRONE_INV_MASS, physicsStep->force);
-        contrib[physicsStep->srcIdx] = b2MulAdd(contrib[physicsStep->srcIdx], e->deltaTime, invForce);
-        contrib[physicsStep->srcIdx] = b2MulAdd(contrib[physicsStep->srcIdx], DRONE_INV_MASS, physicsStep->impulse);
-
-        // DEBUG_LOGF("# step %d drone %d contrib %f (%f, %f)", physicsStep->step, physicsStep->srcIdx, b2Length(contrib[physicsStep->srcIdx]), contrib[physicsStep->srcIdx].x, contrib[physicsStep->srcIdx].y);
-    }
-
+int8_t findBiggestContributor(const iwEnv *e, const fsVec2 contributions[], const fsVec2 velocity, float *maxMoveContrib) {
     // determine the killer by finding the drone that pushed the dead
     // drone towards the wall that killed it the most
-    const b2Vec2 deathNormal = b2Normalize(lastVelocity);
-    DEBUG_LOGF("> death normal (%f, %f) velocity (%f, %f)", deathNormal.x, deathNormal.y, lastVelocity.x, lastVelocity.y);
+    const fsVec2 deathNormal = fsNormalize(velocity);
+    DEBUG_LOGF("> death normal (%f, %f) velocity (%f, %f)", deathNormal.x, deathNormal.y, velocity.x, velocity.y);
     float maxContrib = -FLT_MAX;
     int8_t killer = -1;
     for (uint8_t i = 0; i < e->numDrones; i++) {
-        DEBUG_LOGF("---\n> src drone contrib %d %f (%f, %f)", i, b2Length(contrib[i]), contrib[i].x, contrib[i].y);
-        if (b2VecEqual(contrib[i], b2Vec2_zero)) {
+        DEBUG_LOGF("---\n> src drone contrib %d %f (%f, %f)", i, fsLength(contributions[i]), contributions[i].x, contributions[i].y);
+        if (fsVecEqual(contributions[i], fsVec2_zero)) {
             continue;
         }
 
-        const b2Vec2 normContrib = b2Normalize(contrib[i]);
-        const float dot = b2Dot(normContrib, deathNormal);
-        DEBUG_LOGF("> > src drone %d norm contrib (%f, %f)", i, normContrib.x, normContrib.y);
-        DEBUG_LOGF("> src drone %d death normal dot %f", i, dot);
-        const float totalContrib = b2Length(contrib[i]) * dot;
-        DEBUG_LOGF("> src drone %d total contrib %f", i, totalContrib);
-        if (totalContrib > maxContrib) {
-            maxContrib = totalContrib;
+        const float currentContrib = fsDot(contributions[i], deathNormal);
+        if (currentContrib > maxContrib) {
+            maxContrib = currentContrib;
             killer = i;
         }
     }
-    if (killer != -1) {
-        *maxMoveContrib = maxContrib;
-    }
+
+    *maxMoveContrib = maxContrib;
     return killer;
 }
+
 
 void findDroneKiller(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
     float maxMoveContrib = -FLT_MAX;
     DEBUG_LOG("finding drone killer");
-    int8_t killer = findBiggestContributor(e, DRONE_ENTITY, drone->physicsTracking, drone->lastVelocity, &maxMoveContrib);
+    int8_t killer = findBiggestContributor(e, drone->contributions, drone->velocity, &maxMoveContrib);
     if (killWall != NULL && killWall->isFloating) {
         float wallContrib = -FLT_MAX;
         DEBUG_LOG("finding mover of floating death wall");
-        const int8_t wallMover = findBiggestContributor(e, DEATH_WALL_ENTITY, killWall->physicsTracking, killWall->velocity, &wallContrib);
+        const int8_t wallMover = findBiggestContributor(e, killWall->contributions, killWall->velocity, &wallContrib);
         if (wallContrib > maxMoveContrib) {
             DEBUG_LOGF(">>> drone %d killed by drone %d pushing floating death wall", drone->idx, wallMover);
             killer = wallMover;
         }
     }
+
 
     if (killer == -1) {
         DEBUG_LOGF(">>> drone %d killed by UNKNOWN", drone->idx);
@@ -1054,24 +834,25 @@ void killDrone(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
         createDronePiece(e, drone, false);
     }
 
-    b2Body_Disable(drone->bodyID);
+    drone->body->isActive = false;
     droneChangeWeapon(e, drone, e->defaultWeapon->type);
     drone->braking = false;
     drone->chargingBurst = false;
     drone->energyFullyDepleted = false;
     drone->shotThisStep = false;
-    drone->velocity = b2Vec2_zero;
-    drone->lastVelocity = b2Vec2_zero;
+    drone->velocity = fsVec2_zero;
+    drone->lastVelocity = fsVec2_zero;
 }
 
 bool respawnDrone(iwEnv *e, droneEntity *drone) {
-    b2Vec2 pos;
+    fsVec2 pos;
     if (!findOpenPos(e, DRONE_SHAPE, &pos, -1)) {
         return false;
     }
-    b2Body_SetTransform(drone->bodyID, pos, b2Rot_identity);
-    b2Body_Enable(drone->bodyID);
-    b2Body_SetLinearDamping(drone->bodyID, DRONE_LINEAR_DAMPING);
+    drone->body->pos = pos;
+    drone->body->angle = 0;
+    drone->body->isActive = true;
+    drone->body->vel = fsVec2_zero;
 
     drone->dead = false;
     drone->pos = pos;
@@ -1089,7 +870,7 @@ bool respawnDrone(iwEnv *e, droneEntity *drone) {
     return true;
 }
 
-void createProjectile(iwEnv *e, droneEntity *drone, const b2Vec2 normAim) {
+void createProjectile(iwEnv *e, droneEntity *drone, const fsVec2 normAim) {
     ASSERT_VEC_NORMALIZED(normAim);
 
     const float radius = drone->weaponInfo->radius;
@@ -1099,7 +880,7 @@ void createProjectile(iwEnv *e, droneEntity *drone, const b2Vec2 normAim) {
     }
     // spawn the projectile just outside the drone so they don't
     // immediately collide
-    b2Vec2 pos = b2MulAdd(drone->pos, droneRadius + (radius * 1.5f), normAim);
+    fsVec2 pos = fsMulAdd(drone->pos, droneRadius + (radius * 1.5f), normAim);
      // if the projectile is inside a wall or out of the map, move the
     // projectile to be just outside the wall
     bool projectileInWall = false;
@@ -1112,104 +893,63 @@ void createProjectile(iwEnv *e, droneEntity *drone, const b2Vec2 normAim) {
             projectileInWall = true;
         }
     }
-        if (projectileInWall) {
-        const b2Vec2 rayEnd = b2MulAdd(drone->pos, droneRadius + (radius * 2.5f), normAim);
-        const b2Vec2 translation = b2Sub(rayEnd, drone->pos);
-        const b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE};
-        const b2RayResult rayRes = b2World_CastRayClosest(e->worldID, drone->pos, translation, filter);
+    if (projectileInWall) {
+        fsRayCastResult rayRes = fsRayCast(&e->world, drone->pos, normAim, droneRadius + (radius * 2.5f), (entity*)drone->ent);
         if (rayRes.hit) {
-            const b2Vec2 invNormAim = b2MulSV(-1.0f, normAim);
-            pos = b2MulAdd(rayRes.point, radius * 1.5f, invNormAim);
+            fsVec2 hitPoint = fsAdd(drone->pos, fsMul(normAim, rayRes.fraction * (droneRadius + (radius * 2.5f))));
+            pos = fsAdd(hitPoint, fsMul(normAim, -radius * 1.5f));
         }
     }
 
-    b2BodyDef projectileBodyDef = b2DefaultBodyDef();
-    projectileBodyDef.type = b2_dynamicBody;
-    projectileBodyDef.isBullet = drone->weaponInfo->isPhysicsBullet;
-    projectileBodyDef.linearDamping = drone->weaponInfo->damping;
-    projectileBodyDef.enableSleep = drone->weaponInfo->canSleep;
-    projectileBodyDef.position = pos;
-    b2BodyId projectileBodyID = b2CreateBody(e->worldID, &projectileBodyDef);
-    b2ShapeDef projectileShapeDef = b2DefaultShapeDef();
-    projectileShapeDef.enableContactEvents = true;
-    projectileShapeDef.density = drone->weaponInfo->density;
-    projectileShapeDef.material.restitution = 1.0f;
-    projectileShapeDef.material.friction = 0.0f;
-    projectileShapeDef.filter.categoryBits = PROJECTILE_SHAPE;
-    projectileShapeDef.filter.maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE;
-    const b2Circle projectileCircle = {.center = b2Vec2_zero, .radius = radius};
+    fsBody *b = fsWorld_CreateBody(&e->world);
+    b->pos = pos;
+    b->isStatic = false;
+    b->invMass = (drone->weaponInfo->mass > 0) ? 1.0f / drone->weaponInfo->mass : 0.0f;
+    b->categoryBits = PROJECTILE_SHAPE;
+    b->maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE;
+    b->shape.type = FS_CIRCLE;
+    b->shape.circle.radius = radius;
+    b->isSensor = drone->weaponInfo->isSensor;
 
-     b2ShapeId projectileShapeID = b2CreateCircleShape(projectileBodyID, &projectileShapeDef, &projectileCircle);
-
-    // add a bit of lateral drone velocity to projectile
-    b2Vec2 forwardVel = b2MulSV(b2Dot(drone->velocity, normAim), normAim);
-    b2Vec2 lateralVel = b2Sub(drone->velocity, forwardVel);
-    lateralVel = b2MulSV(projectileShapeDef.density * DRONE_MOVE_AIM_COEF, lateralVel);
-        b2Vec2 aim = weaponAdjustAim(&e->randState, drone->weaponInfo->type, drone->heat, normAim);
-        b2Vec2 fire = b2MulAdd(lateralVel, weaponFire(&e->randState, drone->weaponInfo->type), aim);
-        b2Body_ApplyLinearImpulseToCenter(projectileBodyID, fire, true);
-
-        projectileEntity *projectile = fastCalloc(1, sizeof(projectileEntity));
-        projectile->droneIdx = drone->idx;
-        projectile->bodyID = projectileBodyID;
-        projectile->shapeID = projectileShapeID;
-        projectile->weaponInfo = drone->weaponInfo;
-        projectile->pos = projectileBodyDef.position;
-        projectile->lastPos = projectileBodyDef.position;
-        projectile->velocity = b2Body_GetLinearVelocity(projectileBodyID);
-        projectile->lastVelocity = projectile->velocity;
-        projectile->speed = b2Length(projectile->velocity);
-        projectile->lastSpeed = projectile->speed;
-        if (projectile->weaponInfo->type == BLACK_HOLE_WEAPON) {
-            create_array(&projectile->entsInBlackHole, 4);
-        }
-        cc_array_add(e->projectiles, projectile);
-
-        entity *ent = createEntity(e, PROJECTILE_ENTITY, projectile);
-        projectile->ent = ent;
-        b2Body_SetUserData(projectile->bodyID, ent);
-        b2Shape_SetUserData(projectile->shapeID, ent);
-
-    // create a sensor shape if needed
-    if (projectile->weaponInfo->hasSensor) {
-        projectile->sensorID = weaponSensor(projectile->bodyID, projectile->weaponInfo->type);
-        b2Shape_SetUserData(projectile->sensorID, ent);
-    }
-}
-
-// compute value generally from 0-1 based off of how much a projectile(s)
-// or explosion(s) caused the hit drone to change velocity
-float computeHitStrength(const droneEntity *hitDrone) {
-    const float prevSpeed = b2Length(hitDrone->lastVelocity);
-    const float curSpeed = b2Length(hitDrone->velocity);
-    return fabsf(curSpeed - prevSpeed) / MAX_SPEED;
-}
-
-// simplified and copied from box2d/src/shape.c
-float getShapeProjectedPerimeter(const b2ShapeId shapeID, const b2Vec2 line) {
-    if (b2Shape_GetType(shapeID) == b2_circleShape) {
-        const b2Circle circle = b2Shape_GetCircle(shapeID);
-        return circle.radius * 2.0f;
+    projectileEntity *projectile;
+    if (cc_array_size(e->projectilePool) > 0) {
+        cc_array_remove_last(e->projectilePool, (void **)&projectile);
+        memset(projectile, 0, sizeof(projectileEntity));
+    } else {
+        projectile = fastCalloc(1, sizeof(projectileEntity));
     }
 
-    const b2Polygon polygon = b2Shape_GetPolygon(shapeID);
-    const b2Vec2 *points = polygon.vertices;
-    int count = polygon.count;
-    //B2_ASSERT(count > 0);
-    float value = b2Dot(points[0], line);
-    float lower = value;
-    float upper = value;
-    for (int i = 1; i < count; ++i) {
-        value = b2Dot(points[i], line);
-        lower = b2MinFloat(lower, value);
-        upper = b2MaxFloat(upper, value);
-    }
+    projectile->body = b;
+    projectile->droneIdx = drone->idx;
+    projectile->weaponInfo = drone->weaponInfo;
+    projectile->pos = pos;
+    projectile->lastPos = pos;
+    
+    // Add lateral velocity and weapon variance
+    fsVec2 aim = weaponAdjustAim(&e->randState, drone->weaponInfo->type, drone->heat, normAim);
+    projectile->velocity = fsMul(aim, drone->weaponInfo->speed);
+    b->vel = projectile->velocity;
 
-    return upper - lower;
+    projectile->lastVelocity = projectile->velocity;
+    projectile->speed = drone->weaponInfo->speed;
+    projectile->lastSpeed = drone->weaponInfo->speed;
+    projectile->mapCellIdx = entityPosToCellIdx(e, pos);
+    projectile->numDronesBehindWalls = 0;
+    if (e->client != NULL) {
+        memset(&projectile->trailPoints, 0x0, sizeof(trailPoints));
+    }
+    if (drone->weaponInfo->type == BLACK_HOLE_WEAPON) {
+        create_array(&projectile->entsInBlackHole, 16);
+    }
+    projectile->needsToBeDestroyed = false;
+
+    entity *ent = createEntity(e, PROJECTILE_ENTITY, projectile);
+    projectile->ent = ent;
+    b->userData = ent;
+
+    cc_array_add(e->projectiles, projectile);
 }
 
-// explodes projectile and ensures any other projectiles that are caught
-// in the explosion are also destroyed if necessary
 void createProjectileExplosion(iwEnv *e, projectileEntity *projectile, const bool initalProjectile) {
     if (projectile->needsToBeDestroyed) {
         return;
@@ -1217,38 +957,17 @@ void createProjectileExplosion(iwEnv *e, projectileEntity *projectile, const boo
     projectile->needsToBeDestroyed = true;
     cc_array_add(e->explodingProjectiles, projectile);
 
-    b2ExplosionDef explosion;
-    weaponExplosion(projectile->weaponInfo->type, &explosion);
-    explosion.position = projectile->pos;
-    explosion.maskBits = FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE;
-    droneEntity *parentDrone = safe_array_get_at(e->drones, projectile->droneIdx);
-    createExplosion(e, parentDrone, projectile, &explosion);
-
-    if (e->client != NULL) {
-        explosionInfo *explInfo = fastCalloc(1, sizeof(explosionInfo));
-        explInfo->def = explosion;
-        explInfo->renderSteps = UINT16_MAX;
-        cc_array_add(e->explosions, explInfo);
-    }
-    if (!initalProjectile) {
-        return;
-    }
-
-    // if we're not destroying the projectiles now, we need to remove the initial projectile
-    // from the list of exploding projectiles so it's not destroyed twice
-    const enum cc_stat res = cc_array_remove_fast(e->explodingProjectiles, projectile, NULL);
-    MAYBE_UNUSED(res);
-    ASSERT(res == CC_OK);
+    droneEntity *drone = safe_array_get_at(e->drones, projectile->droneIdx);
+    createExplosion(e, drone, projectile, projectile->pos, 2.0f, 10.0f, FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE);
 }
 
-// ensures projectiles don't slow down when an impluse is applied to them
 void fixProjectileSpeed(projectileEntity *projectile) {
-    b2Vec2 newVel = b2Body_GetLinearVelocity(projectile->bodyID);
-    float newSpeed = b2Length(newVel);
+    fsVec2 newVel = projectile->body->vel;
+    float newSpeed = fsLength(newVel);
     if (newSpeed < projectile->lastSpeed) {
         newSpeed = projectile->lastSpeed;
-        newVel = b2MulSV(newSpeed, b2Normalize(newVel));
-        b2Body_SetLinearVelocity(projectile->bodyID, newVel);
+        newVel = fsMul(fsNormalize(newVel), newSpeed);
+        projectile->body->vel = newVel;
     }
 
     projectile->velocity = newVel;
@@ -1260,378 +979,47 @@ void fixProjectileSpeed(projectileEntity *projectile) {
 
 typedef struct wallBurstImpulse {
     float distance;
-    b2Vec2 direction;
+    fsVec2 direction;
     float magnitude;
     uint16_t wallCellIdx;
 } wallBurstImpulse;
 
-typedef struct explosionCtx {
-    iwEnv *e;
-    const bool isBurst;
-    droneEntity *parentDrone;
-    const projectileEntity *projectile;
-    const b2ExplosionDef *def;
 
-    wallBurstImpulse wallImpulses[MAX_WALL_HITS];
-    int8_t closestWallIdx;
-    uint8_t wallsHit;
-} explosionCtx;
-
-const float COS_85_DEGREES = 0.087155743f;
-
-// b2World_Explode doesn't support filtering on shapes of the same category,
-// so we have to do it manually
-// mostly copied from box2d/src/world.c
-bool explodeCallback(b2ShapeId shapeID, void *context) {
-    if (!b2Shape_IsValid(shapeID)) {
-        return true;
-    }
-
-    explosionCtx *ctx = context;
-    const entity *entity = b2Shape_GetUserData(shapeID);
-    projectileEntity *projectile = NULL;
-    droneEntity *drone = NULL;
-    wallEntity *wall = NULL;
-    bool isStaticWall = false;
-    b2Transform transform;
-
-    switch (entity->type) {
-    case PROJECTILE_ENTITY:
-        // don't explode the parent projectile
-        projectile = entity->entity;
-        if (ctx->projectile != NULL && (ctx->projectile == projectile || projectile->needsToBeDestroyed)) {
-            return true;
-        }
-        transform.p = projectile->pos;
-        transform.q = b2Rot_identity;
-        break;
-    case DRONE_ENTITY:
-        drone = entity->entity;
-        // the explosion shouldn't affect the parent drone if this is a burst
-        if (drone->idx == ctx->parentDrone->idx) {
-            if (ctx->isBurst) {
-                return true;
-            }
-
-            drone->stepInfo.ownShotTaken = true;
-            ctx->e->stats[drone->idx].ownShotsTaken[ctx->projectile->weaponInfo->type]++;
-            ctx->e->stats[drone->idx].totalOwnShotsTaken++;
-            DEBUG_LOGF("drone %d hit itself with explosion from weapon %d", drone->idx, ctx->projectile->weaponInfo->type);
-        }
-        if (ctx->isBurst) {
-            DEBUG_LOGF("drone %d hit drone %d with burst", ctx->parentDrone->idx, drone->idx);
-            ctx->e->stats[ctx->parentDrone->idx].burstsHit++;
-            DEBUG_LOGF("drone %d hit by burst from drone %d", drone->idx, ctx->parentDrone->idx);
-        } else {
-            DEBUG_LOGF("drone %d hit drone %d with explosion from weapon %d", ctx->parentDrone->idx, drone->idx, ctx->projectile->weaponInfo->type);
-            ctx->e->stats[ctx->parentDrone->idx].shotsHit[ctx->projectile->weaponInfo->type]++;
-            ctx->e->stats[ctx->parentDrone->idx].totalShotsHit++;
-            DEBUG_LOGF("drone %d hit by explosion from weapon %d from drone %d", drone->idx, ctx->projectile->weaponInfo->type, ctx->parentDrone->idx);
-        }
-        transform.p = drone->pos;
-        transform.q = b2Rot_identity;
-        break;
-    case STANDARD_WALL_ENTITY:
-    case BOUNCY_WALL_ENTITY:
-    case DEATH_WALL_ENTITY:
-        wall = entity->entity;
-        isStaticWall = !wall->isFloating;
-        // normal explosions don't affect static walls
-        if (!ctx->isBurst && isStaticWall) {
-            return true;
-        }
-        transform.p = wall->pos;
-        transform.q = wall->rot;
-        break;
-    default:
-        ERRORF("invalid entity type %d to explode", entity->type);
-    }
-
-    // find the closest point from the entity to the explosion center
-    const b2BodyId bodyID = b2Shape_GetBody(shapeID);
-    ASSERT(b2Body_IsValid(bodyID));
-
-    bool isCircle = false;
-    b2DistanceInput input;
-    input.proxyA = makeDistanceProxy(entity, &isCircle);
-    input.proxyB = b2MakeProxy(&ctx->def->position, 1, 0.0f);
-    input.transformA = transform;
-    input.transformB = b2Transform_identity;
-    input.useRadii = isCircle;
-
-    b2SimplexCache cache = {0};
-    const b2DistanceOutput output = b2ShapeDistance(&input, &cache, NULL, 0);
-
-    if (output.distance > ctx->def->radius) {
-        return true;
-    }
-
-    // don't explode the entity if it's behind a static or floating wall,
-    // but always consider floating walls for implosions
-    const bool isImplosion = ctx->def->impulsePerLength < 0.0f;
-    b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE};
-    if (!isImplosion) {
-        filter.maskBits |= FLOATING_WALL_SHAPE;
-    }
-    if (posBehindWall(ctx->e, ctx->def->position, output.pointA, entity, filter, NULL)) {
-        return true;
-    }
-
-    const b2Vec2 closestPoint = output.pointA;
-    b2Vec2 direction;
-    if (isStaticWall) {
-        direction = b2Normalize(b2Sub(ctx->def->position, closestPoint));
-    } else {
-        direction = b2Normalize(b2Sub(closestPoint, ctx->def->position));
-    }
-    // if the direction is zero, the magnitude cannot be calculated
-    // correctly so set the direction randomly
-    if (b2VecEqual(direction, b2Vec2_zero)) {
-        direction.x = randFloat(&ctx->e->randState, -1.0f, 1.0f);
-        direction.y = randFloat(&ctx->e->randState, -1.0f, 1.0f);
-        direction = b2Normalize(direction);
-    }
-
-    b2Vec2 localLine = b2Vec2_zero;
-    if (entityTypeIsWall(entity->type)) {
-        // the localLine isn't used in perimeter calculations for circles
-        localLine = b2InvRotateVector(transform.q, b2LeftPerp(direction));
-    }
-    float perimeter = getShapeProjectedPerimeter(shapeID, localLine);
-    const float relDistance = output.distance / ctx->def->radius;
-    const float scale = 1.0f - (SQUARED(relDistance) * relDistance);
-
-    // the parent drone or projecile's velocity affects the direction
-    // and magnitude of the explosion
-    b2Vec2 parentVelocity;
-    float parentSpeed;
-    if (ctx->projectile != NULL) {
-        // use the projectile's last velocity and speed if it is in
-        // contact with another body, as the current velocity will be
-        // the velocity after the projectile rebounds which is not
-        // what we want
-        if (ctx->projectile->contacts != 0) {
-            parentVelocity = ctx->projectile->lastVelocity;
-            parentSpeed = ctx->projectile->lastSpeed;
-        } else {
-            parentVelocity = ctx->projectile->velocity;
-            parentSpeed = ctx->projectile->speed;
-        }
-        if (isImplosion) {
-            parentSpeed *= -1.0f;
-        }
-    } else {
-        parentVelocity = ctx->parentDrone->lastVelocity;
-        parentSpeed = b2Length(parentVelocity);
-    }
-    const b2Vec2 parentDirection = b2Normalize(parentVelocity);
-
-    // scale the parent speed by how close the movement direction of
-    // the parent is to where the entity is to the parent, except if
-    // we're bursting off of a wall to make it more predictable and
-    // to prevent taking a log of a negative number
-    if (!isStaticWall) {
-        parentSpeed *= b2Dot(direction, parentDirection);
-    }
-    // the parent entity's velocity affects the direction of the impulse
-    // depending on the speed
-    const b2Vec2 baseImpulse = b2MulSV(fabsf(ctx->def->impulsePerLength), direction);
-    direction = b2Normalize(b2Add(baseImpulse, parentVelocity));
-
-    float shieldReduction = 1.0f;
-    if (drone != NULL && drone->shield != NULL) {
-        shieldReduction = DRONE_SHIELD_EXPLOSION_REDUCTION;
-    }
-
-    float magnitude = (ctx->def->impulsePerLength + parentSpeed) * perimeter * scale * shieldReduction;
-    if (isStaticWall) {
-        // ensure this wall faces at least 85 degrees away from the
-        // closest hit wall to prevent multiple walls facing roughly
-        // the same direction greatly increasing the impulse magnitude
-        if (ctx->closestWallIdx == -1) {
-            ctx->closestWallIdx = 0;
-        } else {
-            const float closestWallDistance = ctx->wallImpulses[ctx->closestWallIdx].distance;
-            if (output.distance < closestWallDistance) {
-                ctx->closestWallIdx = ctx->wallsHit;
-
-                for (int8_t i = 0; i < ctx->wallsHit; i++) {
-                    const wallBurstImpulse impulse = ctx->wallImpulses[i];
-                    if (impulse.distance != output.distance && b2Dot(impulse.direction, direction) > COS_85_DEGREES) {
-                        ctx->wallImpulses[i] = ctx->wallImpulses[--ctx->wallsHit];
-                        i--;
-                    }
-                }
-            }
-        }
-
-        // reduce the magnitude when pushing a drone away from a wall
-        magnitude = log2f(magnitude) * (5.0f + (25.0f * ctx->parentDrone->burstCharge));
-
-        ctx->wallImpulses[ctx->wallsHit++] = (wallBurstImpulse){
-            .distance = output.distance,
-            .direction = direction,
-            .magnitude = magnitude,
-            .wallCellIdx = wall->mapCellIdx,
-        };
-        return true;
-    }
-    const b2Vec2 impulse = b2MulSV(magnitude, direction);
-    ASSERT(b2IsValidVec2(impulse));
-
-    switch (entity->type) {
-    case STANDARD_WALL_ENTITY:
-    case BOUNCY_WALL_ENTITY:
-    case DEATH_WALL_ENTITY:
-        if (wall->isFloating) {
-            applyTrackedImpulse(ctx->e, wall->bodyID, wall->physicsTracking, impulse, ctx->parentDrone->idx);
-        } else {
-            b2Body_ApplyLinearImpulse(bodyID, impulse, output.pointA, true);
-        }
-        wall->velocity = b2Body_GetLinearVelocity(wall->bodyID);
-        break;
-    case PROJECTILE_ENTITY:
-        b2Body_ApplyLinearImpulseToCenter(bodyID, impulse, true);
-        // mine launcher projectiles explode when caught in another
-        // explosion, explode this mine only once
-        if (projectile->weaponInfo->type == MINE_LAUNCHER_WEAPON && ctx->def->impulsePerLength > 0.0f) {
-            createProjectileExplosion(ctx->e, projectile, false);
-            break;
-        }
-
-        fixProjectileSpeed(projectile);
-
-        break;
-    case DRONE_ENTITY:
-        applyTrackedImpulse(ctx->e, drone->bodyID, drone->physicsTracking, impulse, ctx->parentDrone->idx);
-        drone->lastVelocity = drone->velocity;
-        drone->velocity = b2Body_GetLinearVelocity(drone->bodyID);
-
-        shieldEntity *shield = drone->shield;
-
-        // add energy to the drone that fired the projectile that is
-        // currently exploding if it hit another drone
-        if (!ctx->isBurst && drone->team != ctx->parentDrone->team && shield == NULL) {
-            const float energyRefill = computeHitStrength(drone) * EXPLOSION_ENERGY_REFILL_COEF;
-            droneAddEnergy(ctx->parentDrone, energyRefill);
-        } else if (shield != NULL && shield->health > 0.0f) {
-            const float damage = fabsf(magnitude) * DRONE_SHIELD_HEALTH_EXPLOSION_COEF;
-            DEBUG_LOGF("shield explosion damage: %f", damage);
-            shield->health -= damage;
-            if (shield->health <= 0.0f) {
-                droneAddEnergy(ctx->parentDrone, DRONE_SHIELD_BREAK_ENERGY_REFILL);
-            }
-        }
-
-        const float explosionStrength = b2AbsFloat(b2Length(impulse));
-        ctx->parentDrone->stepInfo.explosionHit[drone->idx] += explosionStrength;
-        drone->stepInfo.explosionTaken[ctx->parentDrone->idx] += explosionStrength;
-
-        break;
-    default:
-        ERRORF("unknown entity type for burst impulse %d", entity->type);
-    }
-
-    return true;
-}
-
-void applyDroneBurstImpulse(iwEnv *e, explosionCtx *ctx, const droneEntity *drone) {
-    wallBurstImpulse *hitWalls = ctx->wallImpulses;
-    uint8_t wallsHit = ctx->wallsHit;
-
-    // sort by distance
-    for (int8_t i = 1; i < wallsHit; i++) {
-        wallBurstImpulse key = hitWalls[i];
-        int j = i - 1;
-
-        while (j >= 0 && hitWalls[j].distance > key.distance) {
-            hitWalls[j + 1] = hitWalls[j];
-            j = j - 1;
-        }
-
-        hitWalls[j + 1] = key;
-    }
-
-    for (uint8_t i = 0; i < wallsHit; i++) {
-        const wallBurstImpulse impulseA = hitWalls[i];
-        if (impulseA.distance == FLT_MAX) {
-            continue;
-        }
-        for (uint8_t j = 0; j < wallsHit; j++) {
-            if (j == i) {
-                continue;
-            }
-            wallBurstImpulse impulseB = hitWalls[j];
-            if (impulseB.distance == FLT_MAX) {
-                continue;
-            }
-            const uint8_t cellIdxDiff = abs(impulseB.wallCellIdx - impulseA.wallCellIdx);
-            if (cellIdxDiff == e->map->columns) {
-                hitWalls[j].distance = FLT_MAX;
-                continue;
-            }
-            if (cellIdxDiff == 1) {
-                int8_t colA = impulseA.wallCellIdx / e->map->columns;
-                int8_t colB = impulseB.wallCellIdx / e->map->columns;
-                if (colA == colB) {
-                    hitWalls[j].distance = FLT_MAX;
-                }
-            }
-        }
-    }
-
-    uint8_t wallsUsed = 0;
-    float magnitude = 0.0f;
-    b2Vec2 direction = b2Vec2_zero;
-    for (uint8_t i = 0; i < wallsHit; i++) {
-        const wallBurstImpulse impulse = hitWalls[i];
-        if (impulse.distance == FLT_MAX) {
-            continue;
-        }
-
-        wallsUsed++;
-        magnitude += impulse.magnitude;
-        direction = b2Add(direction, impulse.direction);
-    }
-
-    if (wallsUsed > 2) {
-        DEBUG_LOG("more than 2 walls used");
-    }
-
-    DEBUG_LOGF("walls used: %d magnitude: %f final: %f", wallsUsed, magnitude, magnitude / (float)wallsUsed);
-    const b2Vec2 finalImpulse = b2MulSV(magnitude / (float)wallsUsed, b2Normalize(direction));
-    ASSERT(b2IsValidVec2(finalImpulse));
-    applyTrackedImpulse(e, drone->bodyID, drone->physicsTracking, finalImpulse, drone->idx);
-}
-
-void createExplosion(iwEnv *e, droneEntity *drone, const projectileEntity *projectile, const b2ExplosionDef *def) {
-    b2AABB aabb = {
-        .lowerBound.x = def->position.x - def->radius,
-        .lowerBound.y = def->position.y - def->radius,
-        .upperBound.x = def->position.x + def->radius,
-        .upperBound.y = def->position.y + def->radius,
-    };
-
-    b2QueryFilter filter = b2DefaultQueryFilter();
-    filter.categoryBits = PROJECTILE_SHAPE;
-    filter.maskBits = def->maskBits;
-
+void createExplosion(iwEnv *e, droneEntity *drone, const projectileEntity *projectile, const fsVec2 pos, float radius, float magnitude, uint32_t maskBits) {
     const bool isBurst = projectile == NULL;
-    explosionCtx ctx = {
-        .e = e,
-        .isBurst = isBurst,
-        .parentDrone = drone,
-        .projectile = projectile,
-        .def = def,
-        .wallImpulses = {{0}},
-        .closestWallIdx = -1,
-        .wallsHit = 0,
-    };
-    b2World_OverlapAABB(e->worldID, aabb, filter, explodeCallback, &ctx);
+    
+    for (int i = 0; i < MAX_BODIES; i++) {
+        fsBody *b = &e->world.bodies[i];
+        if (!b->isActive || b->isStatic) continue;
+        if (!(b->categoryBits & maskBits)) continue;
 
-    uint8_t wallsHit = ctx.wallsHit;
-    if (isBurst && wallsHit != 0) {
-        applyDroneBurstImpulse(e, &ctx, drone);
+        fsVec2 delta = fsSub(b->pos, pos);
+        float distSq = fsLengthSq(delta);
+        if (distSq < radius * radius) {
+            float dist = sqrtf(distSq);
+            fsVec2 dir = (dist < 0.001f) ? (fsVec2){0, 1} : fsMul(delta, 1.0f/dist);
+            float force = magnitude * (1.0f - dist/radius);
+            
+            // Check line of sight
+            if (posBehindWall(e, pos, b->pos, b->userData, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
+                continue;
+            }
+
+            b->vel = fsAdd(b->vel, fsMul(dir, force * b->invMass));
+            
+            entity *ent = b->userData;
+            if (ent && ent->type == DRONE_ENTITY) {
+                droneEntity *hitDrone = ent->entity;
+                uint8_t srcIdx = isBurst ? drone->idx : projectile->droneIdx;
+                hitDrone->contributions[srcIdx] = fsAdd(hitDrone->contributions[srcIdx], fsMul(dir, force * b->invMass));
+            } else if (ent && entityTypeIsWall(ent->type)) {
+                wallEntity *wall = ent->entity;
+                if (wall->isFloating) {
+                     uint8_t srcIdx = isBurst ? drone->idx : projectile->droneIdx;
+                     wall->contributions[srcIdx] = fsAdd(wall->contributions[srcIdx], fsMul(dir, force * b->invMass));
+                }
+            }
+        }
     }
 }
 
@@ -1642,8 +1030,7 @@ void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool proces
     }
 
     destroyEntity(e, projectile->ent);
-
-    b2DestroyBody(projectile->bodyID);
+    fsWorld_DestroyBody(projectile->bodyID);
 
     if (full) {
         enum cc_stat res = cc_array_remove_fast(e->projectiles, projectile, NULL);
@@ -1657,13 +1044,16 @@ void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool proces
     if (projectile->entsInBlackHole != NULL) {
         for (uint8_t i = 0; i < cc_array_size(projectile->entsInBlackHole); i++) {
             entityID *id = safe_array_get_at(projectile->entsInBlackHole, i);
-            fastFree(id);
+            cc_array_add(e->entityIdPool, id);
         }
         cc_array_destroy(projectile->entsInBlackHole);
+        projectile->entsInBlackHole = NULL;
     }
 
-    fastFree(projectile);
+    cc_array_add(e->projectilePool, projectile);
 }
+
+
 
 // destroy projectiles that were caught in an explosion; projectiles
 // can't be destroyed in explodeCallback because box2d assumes all shapes
@@ -1685,12 +1075,12 @@ static inline void destroyExplodedProjectiles(iwEnv *e) {
     cc_array_remove_all(e->explodingProjectiles);
 }
 
-void createSuddenDeathWalls(iwEnv *e, const b2Vec2 startPos, const b2Vec2 size) {
+void createSuddenDeathWalls(iwEnv *e, const fsVec2 startPos, const fsVec2 size) {
     int16_t endIdx;
     uint8_t indexIncrement;
     if (size.y == WALL_THICKNESS) {
         // horizontal walls
-        const b2Vec2 endPos = (b2Vec2){.x = startPos.x + size.x, .y = startPos.y};
+        const fsVec2 endPos = (fsVec2){.x = startPos.x + size.x, .y = startPos.y};
         endIdx = entityPosToCellIdx(e, endPos);
         if (endIdx == -1) {
             ERRORF("invalid position for sudden death wall: (%f, %f)", endPos.x, endPos.y);
@@ -1698,7 +1088,7 @@ void createSuddenDeathWalls(iwEnv *e, const b2Vec2 startPos, const b2Vec2 size) 
         indexIncrement = 1;
     } else {
         // vertical walls
-        const b2Vec2 endPos = (b2Vec2){.x = startPos.x, .y = startPos.y + size.y};
+        const fsVec2 endPos = (fsVec2){.x = startPos.x, .y = startPos.y + size.y};
         endIdx = entityPosToCellIdx(e, endPos);
         if (endIdx == -1) {
             ERRORF("invalid position for sudden death wall: (%f, %f)", endPos.x, endPos.y);
@@ -1741,11 +1131,11 @@ void handleSuddenDeath(iwEnv *e) {
     // top walls
     createSuddenDeathWalls(
         e,
-        (b2Vec2){
+        (fsVec2){
             .x = e->map->bounds.min.x + leftX,
             .y = e->map->bounds.min.y + yOffset,
         },
-        (b2Vec2){
+        (fsVec2){
             .x = xWidth,
             .y = WALL_THICKNESS,
         }
@@ -1753,11 +1143,11 @@ void handleSuddenDeath(iwEnv *e) {
     // bottom walls
     createSuddenDeathWalls(
         e,
-        (b2Vec2){
+        (fsVec2){
             .x = e->map->bounds.min.x + leftX,
             .y = e->map->bounds.max.y - yOffset,
         },
-        (b2Vec2){
+        (fsVec2){
             .x = xWidth,
             .y = WALL_THICKNESS,
         }
@@ -1765,11 +1155,11 @@ void handleSuddenDeath(iwEnv *e) {
     // left walls
     createSuddenDeathWalls(
         e,
-        (b2Vec2){
+        (fsVec2){
             .x = e->map->bounds.min.x + leftX,
             .y = e->map->bounds.min.y + (e->suddenDeathWallCounter * WALL_THICKNESS),
         },
-        (b2Vec2){
+        (fsVec2){
             .x = WALL_THICKNESS,
             .y = WALL_THICKNESS * (e->map->rows - (e->suddenDeathWallCounter * 2) - 2),
         }
@@ -1777,11 +1167,11 @@ void handleSuddenDeath(iwEnv *e) {
     // right walls
     createSuddenDeathWalls(
         e,
-        (b2Vec2){
+        (fsVec2){
             .x = e->map->bounds.min.x + ((e->map->columns - e->suddenDeathWallCounter - 2) * WALL_THICKNESS),
             .y = e->map->bounds.min.y + (e->suddenDeathWallCounter * WALL_THICKNESS),
         },
-        (b2Vec2){
+        (fsVec2){
             .x = WALL_THICKNESS,
             .y = WALL_THICKNESS * (e->map->rows - (e->suddenDeathWallCounter * 2) - 2),
         }
@@ -1790,11 +1180,7 @@ void handleSuddenDeath(iwEnv *e) {
     // mark drones as dead if they touch a newly placed wall
     for (uint8_t i = 0; i < e->numDrones; i++) {
         droneEntity *drone = safe_array_get_at(e->drones, i);
-        const b2QueryFilter filter = {
-            .categoryBits = DRONE_SHAPE,
-            .maskBits = WALL_SHAPE,
-        };
-        if (isOverlappingAABB(e, drone->pos, DRONE_RADIUS, filter)) {
+        if (isOverlappingCircleInLineOfSight(e, drone->ent, drone->pos, DRONE_RADIUS, 0, WALL_SHAPE, NULL)) {
             killDrone(e, drone, NULL);
         }
     }
@@ -1812,7 +1198,7 @@ void handleSuddenDeath(iwEnv *e) {
             MAYBE_UNUSED(res);
             ASSERT(res == CC_OK);
 
-            const b2Vec2 wallPos = wall->pos;
+            const fsVec2 wallPos = wall->pos;
             MAYBE_UNUSED(wallPos);
             destroyWall(e, wall, false);
             DEBUG_LOGF("destroyed floating wall at %f, %f", wallPos.x, wallPos.y);
@@ -1833,20 +1219,20 @@ void handleSuddenDeath(iwEnv *e) {
     }
 }
 
-void droneMove(const iwEnv *e, droneEntity *drone, b2Vec2 direction) {
+void droneMove(const iwEnv *e, droneEntity *drone, fsVec2 direction) {
     ASSERT_VEC_BOUNDED(direction);
 
     // if energy is fully depleted halve movement until energy starts
     // to refill again
     if (drone->energyFullyDepleted && drone->energyRefillWait != 0.0f) {
-        direction = b2MulSV(0.5f, direction);
+        direction = fsMul(0.5f, direction);
         drone->lastMove = direction;
     }
-    const b2Vec2 force = b2MulSV(DRONE_MOVE_MAGNITUDE, direction);
-    applyTrackedForce(e, drone->bodyID, drone->physicsTracking, force, drone->idx);
+    const fsVec2 force = fsMul(DRONE_MOVE_MAGNITUDE, direction);
+    applyTrackedForce(e, drone->bodyID, drone->contributions, force, drone->idx);
 }
 
-void droneShoot(iwEnv *e, droneEntity *drone, const b2Vec2 aim, const bool chargingWeapon) {
+void droneShoot(iwEnv *e, droneEntity *drone, const fsVec2 aim, const bool chargingWeapon) {
     ASSERT(drone->ammo != 0);
 
     drone->shotThisStep = true;
@@ -1879,13 +1265,13 @@ void droneShoot(iwEnv *e, droneEntity *drone, const b2Vec2 aim, const bool charg
     drone->chargingWeapon = false;
     drone->weaponCharge = 0.0f;
 
-    b2Vec2 normAim = drone->lastAim;
-    if (!b2VecEqual(aim, b2Vec2_zero)) {
-        normAim = b2Normalize(aim);
+    fsVec2 normAim = drone->lastAim;
+    if (!fsVecEqual(aim, fsVec2_zero)) {
+        normAim = fsNormalize(aim);
     }
     ASSERT_VEC_NORMALIZED(normAim);
-    b2Vec2 recoil = b2MulSV(-drone->weaponInfo->recoilMagnitude, normAim);
-    applyTrackedImpulse(e, drone->bodyID, drone->physicsTracking, recoil, drone->idx);
+    fsVec2 recoil = fsMul(-drone->weaponInfo->recoilMagnitude, normAim);
+    applyTrackedImpulse(e, drone->bodyID, drone->contributions, recoil, drone->idx);
 
     for (int i = 0; i < drone->weaponInfo->numProjectiles; i++) {
         createProjectile(e, drone, normAim);
@@ -1910,14 +1296,20 @@ void droneBrake(iwEnv *e, droneEntity *drone, const bool brake) {
     if (!brake || drone->energyFullyDepleted) {
         if (drone->braking) {
             drone->braking = false;
-            b2Body_SetLinearDamping(drone->bodyID, DRONE_LINEAR_DAMPING);
+            //drone->bodyID, DRONE_LINEAR_DAMPING);
             if (drone->energyRefillWait == 0.0f && !drone->chargingBurst) {
                 drone->energyRefillWait = DRONE_ENERGY_REFILL_WAIT;
             }
-            droneTrackBrake(e, drone);
+
 
             if (e->client != NULL) {
-                brakeTrailPoint *trailPoint = fastCalloc(1, sizeof(brakeTrailPoint));
+                brakeTrailPoint *trailPoint = NULL;
+                if (cc_array_size(e->brakeTrailPointPool) > 0) {
+                    cc_array_remove_last(e->brakeTrailPointPool, (void **)&trailPoint);
+                    memset(trailPoint, 0, sizeof(brakeTrailPoint));
+                } else {
+                    trailPoint = fastCalloc(1, sizeof(brakeTrailPoint));
+                }
                 trailPoint->pos = drone->pos;
                 trailPoint->lifetime = UINT16_MAX;
                 trailPoint->isEnd = true;
@@ -1932,8 +1324,8 @@ void droneBrake(iwEnv *e, droneEntity *drone, const bool brake) {
     if (brake) {
         if (!drone->braking) {
             drone->braking = true;
-            b2Body_SetLinearDamping(drone->bodyID, DRONE_LINEAR_DAMPING * DRONE_BRAKE_DAMPING_COEF);
-            droneTrackBrake(e, drone);
+            //drone->bodyID, DRONE_LINEAR_DAMPING * DRONE_BRAKE_DAMPING_COEF);
+
         }
         drone->energyLeft = max(drone->energyLeft - (DRONE_BRAKE_DRAIN_RATE * e->deltaTime), 0.0f);
         e->stats[drone->idx].brakeTime += e->deltaTime;
@@ -1949,7 +1341,13 @@ void droneBrake(iwEnv *e, droneEntity *drone, const bool brake) {
     }
 
     if (e->client != NULL) {
-        brakeTrailPoint *trailPoint = fastCalloc(1, sizeof(brakeTrailPoint));
+        brakeTrailPoint *trailPoint = NULL;
+        if (cc_array_size(e->brakeTrailPointPool) > 0) {
+            cc_array_remove_last(e->brakeTrailPointPool, (void **)&trailPoint);
+            memset(trailPoint, 0, sizeof(brakeTrailPoint));
+        } else {
+            trailPoint = fastCalloc(1, sizeof(brakeTrailPoint));
+        }
         trailPoint->pos = drone->pos;
         trailPoint->lifetime = UINT16_MAX;
         cc_array_add(drone->brakeTrailPoints, trailPoint);
@@ -1983,14 +1381,8 @@ void droneBurst(iwEnv *e, droneEntity *drone) {
     }
 
     const float radius = (DRONE_BURST_RADIUS_BASE * drone->burstCharge) + DRONE_BURST_RADIUS_MIN;
-    b2ExplosionDef explosion = {
-        .position = drone->pos,
-        .radius = radius,
-        .falloff = 0.0f,
-        .impulsePerLength = (DRONE_BURST_IMPACT_BASE * drone->burstCharge) + DRONE_BURST_IMPACT_MIN,
-        .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE,
-    };
-    createExplosion(e, drone, NULL, &explosion);
+    const float magnitude = (DRONE_BURST_IMPACT_BASE * drone->burstCharge) + DRONE_BURST_IMPACT_MIN;
+    createExplosion(e, drone, NULL, drone->pos, radius, magnitude, WALL_SHAPE | FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE);
     destroyExplodedProjectiles(e);
 
     drone->chargingBurst = false;
@@ -2005,13 +1397,20 @@ void droneBurst(iwEnv *e, droneEntity *drone) {
     e->stats[drone->idx].totalBursts++;
 
     if (e->client != NULL) {
-        explosionInfo *explInfo = fastCalloc(1, sizeof(explosionInfo));
+        explosionInfo *explInfo;
+        if (cc_array_size(e->explosionPool) > 0) {
+            cc_array_remove_last(e->explosionPool, (void **)&explInfo);
+            memset(explInfo, 0, sizeof(explosionInfo));
+        } else {
+            explInfo = fastCalloc(1, sizeof(explosionInfo));
+        }
         explInfo->def = explosion;
         explInfo->isBurst = true;
         explInfo->droneIdx = drone->idx;
         explInfo->renderSteps = UINT16_MAX;
         cc_array_add(e->explosions, explInfo);
     }
+
 }
 
 void droneDiscardWeapon(iwEnv *e, droneEntity *drone) {
@@ -2077,7 +1476,7 @@ bool droneStep(iwEnv *e, droneEntity *drone) {
         drone->energyFullyDepleted = false;
     }
 
-    const float distance = b2Distance(drone->lastPos, drone->pos);
+    const float distance = fsDistance(drone->lastPos, drone->pos);
     e->stats[drone->idx].distanceTraveled += distance;
 
     shieldEntity *shield = drone->shield;
@@ -2101,97 +1500,65 @@ void handleBlackHolePull(iwEnv *e, projectileEntity *projectile) {
         // check if the entity is still valid
         const entity *ent = getEntityByID(e, id);
         if (ent == NULL) {
-            fastFree(id);
+            cc_array_add(e->entityIdPool, id);
             enum cc_stat res = cc_array_iter_remove_fast(&entIter, NULL);
             MAYBE_UNUSED(res);
             ASSERT(res == CC_OK);
             continue;
         }
-        const b2DistanceOutput output = closestPoint(projectile->ent, ent);
-        const b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE};
-        if (posBehindWall(e, projectile->pos, output.pointB, ent, filter, NULL)) {
+        float distance = fsLength(fsSub(ent->pos, projectile->pos));
+        if (posBehindWall(e, projectile->pos, ent->pos, ent, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
             continue;
         }
 
-        b2BodyId bodyID;
-        b2ShapeId shapeID;
-        b2Rot rot;
-
-        wallEntity *wall;
-        droneEntity *drone;
-        projectileEntity *proj;
+        fsBody *body = NULL;
+        fsVec2 *contributions = NULL;
         bool hasShield = false;
 
         switch (ent->type) {
         case STANDARD_WALL_ENTITY:
         case BOUNCY_WALL_ENTITY:
-        case DEATH_WALL_ENTITY:
-            wall = ent->entity;
-            shapeID = wall->shapeID;
-            rot = wall->rot;
+        case DEATH_WALL_ENTITY: {
+            wallEntity *wall = ent->entity;
+            body = wall->body;
+            if (wall->isFloating) contributions = wall->contributions;
             break;
-        case DRONE_ENTITY:
-            drone = ent->entity;
-            shapeID = drone->shapeID;
+        }
+        case DRONE_ENTITY: {
+            droneEntity *drone = ent->entity;
+            body = drone->body;
+            contributions = drone->contributions;
             hasShield = drone->shield != NULL;
             break;
-        case PROJECTILE_ENTITY:
-            proj = ent->entity;
-            bodyID = proj->bodyID;
-            shapeID = proj->shapeID;
+        }
+        case PROJECTILE_ENTITY: {
+            projectileEntity *proj = ent->entity;
+            body = proj->body;
             break;
+        }
         default:
-            ERRORF("unknown entity type %d for black hole suck", ent->type);
+            break;
         }
 
-        b2Vec2 direction = b2Normalize(b2Sub(output.pointB, projectile->pos));
+        if (body == NULL) continue;
 
-        b2Vec2 localLine = b2Vec2_zero;
-        if (entityTypeIsWall(ent->type)) {
-            // the localLine isn't used in perimeter calculations for circles
-            localLine = b2InvRotateVector(rot, b2LeftPerp(direction));
-        }
-        const float perimeter = getShapeProjectedPerimeter(shapeID, localLine);
+        fsVec2 direction = fsNormalize(fsSub(ent->pos, projectile->pos));
+        float scale = 1.0f - (distance / BLACK_HOLE_PROXIMITY_RADIUS);
+        if (scale < 0) scale = 0;
 
-        const float scale = 1.0f - (output.distance / BLACK_HOLE_PROXIMITY_RADIUS);
-
-        // the projecile's velocity affects the direction
-        // and magnitude of the force
-        b2Vec2 parentVelocity = projectile->velocity;
-        float parentSpeed = projectile->speed;
-        if (projectile->contacts != 0) {
-            parentVelocity = projectile->lastVelocity;
-            parentSpeed = projectile->lastSpeed;
-        }
-        const b2Vec2 parentDirection = b2Normalize(parentVelocity);
-        parentSpeed *= b2Dot(direction, parentDirection);
-        // the parent entity's velocity affects the direction of the force
-        // depending on the speed
-        const b2Vec2 baseForce = b2MulSV(-1.0f * BLACK_HOLE_PULL_MAGNITUDE, direction);
-        direction = b2Normalize(b2Add(baseForce, parentVelocity));
-
-        float magnitude = (BLACK_HOLE_PULL_MAGNITUDE + (-1.0f * parentSpeed)) * perimeter * scale;
+        float magnitude = BLACK_HOLE_PULL_MAGNITUDE * scale;
         if (hasShield) {
             magnitude *= DRONE_SHIELD_EXPLOSION_REDUCTION;
         }
-        const b2Vec2 force = b2MulSV(magnitude, direction);
+        fsVec2 force = fsMul(direction, -magnitude); // Pull towards black hole
 
-        if (entityTypeIsWall(ent->type)) {
-            wallEntity *wall = ent->entity;
-            if (wall->isFloating) {
-                applyTrackedForce(e, wall->bodyID, wall->physicsTracking, force, projectile->droneIdx);
-            } else {
-                b2Body_ApplyForce(wall->bodyID, force, output.pointB, true);
-            }
-        } else if (ent->type == DRONE_ENTITY) {
-            droneEntity *drone = ent->entity;
-            applyTrackedForce(e, drone->bodyID, drone->physicsTracking, force, projectile->droneIdx);
+        if (contributions) {
+            applyTrackedForce(e, body, contributions, force, projectile->droneIdx);
         } else {
-            b2Body_ApplyForceToCenter(bodyID, force, true);
+            b->vel = fsAdd(b->vel, fsMul(fsMul(force, b->invMass), e->deltaTime)); //body, force, true);
         }
     }
 }
-
 void projectilesStep(iwEnv *e) {
     CC_ArrayIter projIter;
     cc_array_iter_init(&projIter, e->projectiles);
@@ -2201,27 +1568,18 @@ void projectilesStep(iwEnv *e) {
             continue;
         }
         const float maxDistance = projectile->weaponInfo->maxDistance;
-        const float distance = b2Distance(projectile->pos, projectile->lastPos);
+        const float distance = fsLength(fsSub(projectile->pos, projectile->lastPos));
         projectile->distance += distance;
 
-        // if a drone is in a set mine's sensor range but behind a wall,
-        // we need to check until the drone leaves the sensor range if
-        // it's not behind the wall anymore as we normally only check if
-        // we need to explode the mine when a drone touches the sensor
         if (projectile->numDronesBehindWalls != 0) {
             bool destroyed = false;
             for (uint8_t i = 0; i < projectile->numDronesBehindWalls; i++) {
                 const uint8_t droneIdx = projectile->dronesBehindWalls[i];
                 const droneEntity *drone = safe_array_get_at(e->drones, droneIdx);
-                // TODO: do we need the closest point here?
-                const b2DistanceOutput output = closestPoint(projectile->ent, drone->ent);
-                const b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE};
-                if (posBehindWall(e, projectile->pos, output.pointB, NULL, filter, NULL)) {
+                if (posBehindWall(e, projectile->pos, drone->pos, NULL, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
                     continue;
                 }
 
-                // we have to destroy the projectile using the iterator so
-                // we can continue to iterate correctly
                 destroyProjectile(e, projectile, true, false);
                 enum cc_stat res = cc_array_iter_remove_fast(&projIter, NULL);
                 MAYBE_UNUSED(res);
@@ -2271,7 +1629,7 @@ void weaponPickupsStep(iwEnv *e) {
             continue;
         }
 
-        b2Vec2 pos;
+        fsVec2 pos;
         if (!findOpenPos(e, WEAPON_PICKUP_SHAPE, &pos, -1)) {
             const enum cc_stat res = cc_array_iter_remove_fast(&iter, NULL);
             MAYBE_UNUSED(res);
@@ -2296,53 +1654,37 @@ void weaponPickupsStep(iwEnv *e) {
     }
 }
 
-// only update positions and velocities of dynamic bodies if they moved
-// this step
 void handleBodyMoveEvents(iwEnv *e) {
-    b2BodyEvents events = b2World_GetBodyEvents(e->worldID);
-    for (int i = 0; i < events.moveCount; i++) {
-        const b2BodyMoveEvent *event = events.moveEvents + i;
-        if (!b2Body_IsValid(event->bodyId)) {
-            continue;
-        }
-        ASSERT(b2IsValidVec2(event->transform.p));
-        const b2Vec2 newPos = event->transform.p;
-        entity *ent = event->userData;
-        if (ent == NULL) {
-            continue;
-        }
+    for (int i = 0; i < MAX_BODIES; i++) {
+        fsBody *b = &e->world.bodies[i];
+        if (!b->isActive || b->isStatic) continue;
 
-        wallEntity *wall;
-        projectileEntity *proj;
-        droneEntity *drone;
-        shieldEntity *shield;
-        dronePieceEntity *piece;
+        entity *ent = b->userData;
+        if (ent == NULL) continue;
+
+        fsVec2 newPos = b->pos;
         int16_t mapIdx;
 
-        // if the new position is out of bounds, destroy the entity unless
-        // a drone is out of bounds, then just kill it
         switch (ent->type) {
         case STANDARD_WALL_ENTITY:
         case BOUNCY_WALL_ENTITY:
-        case DEATH_WALL_ENTITY:
-            wall = ent->entity;
+        case DEATH_WALL_ENTITY: {
+            wallEntity *wall = ent->entity;
             mapIdx = entityPosToCellIdx(e, newPos);
             if (mapIdx == -1) {
-                DEBUG_LOGF("invalid position for floating wall: (%f, %f) destroying", newPos.x, newPos.y);
                 cc_array_remove_fast(e->floatingWalls, wall, NULL);
                 destroyWall(e, wall, false);
                 continue;
             }
             wall->mapCellIdx = mapIdx;
             wall->pos = newPos;
-            wall->rot = event->transform.q;
-            wall->velocity = b2Body_GetLinearVelocity(wall->bodyID);
+            wall->velocity = b->vel;
             break;
-        case PROJECTILE_ENTITY:
-            proj = ent->entity;
+        }
+        case PROJECTILE_ENTITY: {
+            projectileEntity *proj = ent->entity;
             mapIdx = entityPosToCellIdx(e, newPos);
             if (mapIdx == -1) {
-                DEBUG_LOGF("invalid position for projectile: (%f, %f) destroying", newPos.x, newPos.y);
                 destroyProjectile(e, proj, false, true);
                 continue;
             }
@@ -2350,25 +1692,20 @@ void handleBodyMoveEvents(iwEnv *e) {
             proj->lastPos = proj->pos;
             proj->pos = newPos;
             proj->lastVelocity = proj->velocity;
-            proj->velocity = b2Body_GetLinearVelocity(proj->bodyID);
-            // if the projectile doesn't have damping its speed will
-            // only change when colliding with a dynamic body or getting
-            // hit by an explosion, and if it's currently colliding with
-            // something we don't care about the current speed
-            if (proj->weaponInfo->damping != 0.0f && proj->contacts == 0) {
+            proj->velocity = b->vel;
+            if (proj->weaponInfo->damping != 0.0f) {
                 proj->lastSpeed = proj->speed;
-                proj->speed = b2Length(proj->velocity);
+                proj->speed = fsLength(proj->velocity);
             }
-
             if (e->client != NULL) {
                 updateTrailPoints(&proj->trailPoints, MAX_PROJECTLE_TRAIL_POINTS, newPos);
             }
             break;
-        case DRONE_ENTITY:
-            drone = ent->entity;
+        }
+        case DRONE_ENTITY: {
+            droneEntity *drone = ent->entity;
             mapIdx = entityPosToCellIdx(e, newPos);
             if (mapIdx == -1) {
-                DEBUG_LOGF("invalid position for drone: (%f, %f) killing it", newPos.x, newPos.y);
                 killDrone(e, drone, NULL);
                 continue;
             }
@@ -2376,42 +1713,39 @@ void handleBodyMoveEvents(iwEnv *e) {
             drone->lastPos = drone->pos;
             drone->pos = newPos;
             drone->lastVelocity = drone->velocity;
-            drone->velocity = b2Body_GetLinearVelocity(drone->bodyID);
-
+            drone->velocity = b->vel;
             if (e->client != NULL) {
                 updateTrailPoints(&drone->trailPoints, MAX_DRONE_TRAIL_POINTS, newPos);
             }
             break;
-        case SHIELD_ENTITY:
-            shield = ent->entity;
+        }
+        case SHIELD_ENTITY: {
+            shieldEntity *shield = ent->entity;
             shield->pos = newPos;
             break;
-        case DRONE_PIECE_ENTITY:
-            piece = ent->entity;
+        }
+        case DRONE_PIECE_ENTITY: {
+            dronePieceEntity *piece = ent->entity;
             piece->pos = newPos;
-            piece->rot = event->transform.q;
             break;
+        }
         default:
-            ERRORF("unknown entity type for move event %d", ent->type);
+            break;
         }
     }
 }
 
 // destroy the projectile if it has traveled enough or has bounced enough
 // times, and update drone stats if a drone was hit
-uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity *ent, const b2ContactId contactID, const bool projIsShapeA) {
+uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity *ent, fsContact *contact, const bool projIsShapeA) {
     projectileEntity *projectile = proj->entity;
     projectile->contacts++;
 
-    // e (shape B in the collision) will be NULL if it's another
-    // projectile that was just destroyed
     if (ent == NULL || ent->type == PROJECTILE_ENTITY) {
-        // explode mines when hit by a projectile
         if (projectile->weaponInfo->type == MINE_LAUNCHER_WEAPON) {
             uint8_t numDestroyed = 1;
             if (ent != NULL) {
                 const projectileEntity *projectile2 = ent->entity;
-                // if both entities are mines both will be destroyed
                 if (projectile2->weaponInfo->type == MINE_LAUNCHER_WEAPON) {
                     numDestroyed = 2;
                 }
@@ -2420,34 +1754,18 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
             destroyExplodedProjectiles(e);
             return numDestroyed;
         }
-
-        // always allow all other projectiles to bounce off each other
         return false;
     } else if (entityTypeIsWall(ent->type)) {
         wallEntity *wall = ent->entity;
-        if (wall->isFloating && b2Contact_IsValid(contactID)) {
-            const b2Manifold manifold = b2Contact_GetData(contactID).manifold;
-            ASSERT(manifold.pointCount == 1);
-            b2Vec2 hitImpulse = b2MulSV(manifold.points[0].normalImpulse, manifold.normal);
-            if (!projIsShapeA) {
-                hitImpulse = b2Neg(hitImpulse);
-            }
-            applyTrackedImpulse(e, wall->bodyID, wall->physicsTracking, hitImpulse, projectile->droneIdx);
+        if (wall->isFloating) {
+            fsVec2 hitImpulse = fsMul(contact->normal, 0.1f); // Approximation since we don't have impulses yet
+            applyTrackedImpulse(e, wall->body, wall->contributions, hitImpulse, projectile->droneIdx);
         }
-
-        if (ent->type == BOUNCY_WALL_ENTITY) {
-            // always allow projectiles to bounce off bouncy walls
-            return false;
-        }
+        if (ent->type == BOUNCY_WALL_ENTITY) return false;
     } else if (ent->type == SHIELD_ENTITY) {
-        // always allow projectiles to bounce off shields, and update shield health
         shieldEntity *shield = ent->entity;
-        if (shield->health <= 0.0f) {
-            return false;
-        }
-
+        if (shield->health <= 0.0f) return false;
         const float damage = projectile->lastSpeed * projectile->weaponInfo->mass * DRONE_SHIELD_HEALTH_IMPULSE_COEF;
-        DEBUG_LOGF("shield projectile damage: %f", damage);
         shield->health -= damage;
         if (shield->health <= 0.0f) {
             droneEntity *parentDrone = safe_array_get_at(e->drones, projectile->droneIdx);
@@ -2455,30 +1773,21 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
             parentDrone->stepInfo.brokeShield[shield->drone->idx] = true;
             e->stats[parentDrone->idx].shieldsBroken++;
         }
-
         return false;
     }
 
     if (projectile->weaponInfo->type != BLACK_HOLE_WEAPON || ent->type != DRONE_ENTITY) {
         projectile->bounces++;
     }
+
     if (ent->type == DRONE_ENTITY) {
         droneEntity *hitDrone = ent->entity;
-        float hitStrength = 0.0f;
-        if (b2Contact_IsValid(contactID)) {
-            const b2Manifold manifold = b2Contact_GetData(contactID).manifold;
-            ASSERT(manifold.pointCount == 1);
-            b2Vec2 hitImpulse = b2MulSV(manifold.points[0].normalImpulse, manifold.normal);
-            if (!projIsShapeA) {
-                hitImpulse = b2Neg(hitImpulse);
-            }
-            applyTrackedImpulse(e, hitDrone->bodyID, hitDrone->physicsTracking, hitImpulse, projectile->droneIdx);
-            hitStrength = b2AbsFloat(b2Length(hitImpulse));
-        }
+        fsVec2 hitImpulse = fsMul(contact->normal, 0.1f); // Approximation
+        applyTrackedImpulse(e, hitDrone->body, hitDrone->contributions, hitImpulse, projectile->droneIdx);
+        float hitStrength = fsLength(hitImpulse);
 
         if (projectile->droneIdx != hitDrone->idx) {
             droneEntity *shooterDrone = safe_array_get_at(e->drones, projectile->droneIdx);
-
             if (shooterDrone->team != hitDrone->team) {
                 const float impulseEnergy = projectile->lastSpeed * projectile->weaponInfo->mass * projectile->weaponInfo->energyRefillCoef;
                 droneAddEnergy(shooterDrone, impulseEnergy);
@@ -2486,16 +1795,13 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
             shooterDrone->stepInfo.shotHit[hitDrone->idx] += hitStrength;
             e->stats[shooterDrone->idx].shotsHit[projectile->weaponInfo->type]++;
             e->stats[shooterDrone->idx].totalShotsHit++;
-            DEBUG_LOGF("drone %d hit drone %d with weapon %d", shooterDrone->idx, hitDrone->idx, projectile->weaponInfo->type);
             hitDrone->stepInfo.shotTaken[shooterDrone->idx] += hitStrength;
             e->stats[hitDrone->idx].shotsTaken[projectile->weaponInfo->type]++;
             e->stats[hitDrone->idx].totalShotsTaken++;
-            DEBUG_LOGF("drone %d hit by drone %d with weapon %d", hitDrone->idx, shooterDrone->idx, projectile->weaponInfo->type);
         } else {
             hitDrone->stepInfo.ownShotTaken = true;
             e->stats[hitDrone->idx].ownShotsTaken[projectile->weaponInfo->type]++;
             e->stats[hitDrone->idx].totalOwnShotsTaken++;
-            DEBUG_LOGF("drone %d hit by own weapon %d", hitDrone->idx, projectile->weaponInfo->type);
         }
 
         if (projectile->weaponInfo->destroyedOnDroneHit) {
@@ -2504,50 +1810,17 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
             return 1;
         }
     } else if (projectile->weaponInfo->type == MINE_LAUNCHER_WEAPON && !projectile->setMine) {
-        // if the mine is in explosion proximity of a drone now,
-        // destroy it
-        const b2QueryFilter filter = {
-            .categoryBits = PROJECTILE_SHAPE,
-            .maskBits = DRONE_SHAPE,
-        };
-        if (isOverlappingCircleInLineOfSight(e, projectile->ent, projectile->pos, MINE_LAUNCHER_PROXIMITY_RADIUS, filter, NULL)) {
+        if (isOverlappingCircleInLineOfSight(e, projectile->ent, projectile->pos, MINE_LAUNCHER_PROXIMITY_RADIUS, 0, DRONE_SHAPE, NULL)) {
             destroyProjectile(e, projectile, true, true);
             destroyExplodedProjectiles(e);
             return 1;
         }
-
-        // create a weld joint to stick the mine to the wall
-        ASSERT(entityTypeIsWall(ent->type));
-        wallEntity *wall = ent->entity;
-        ASSERT(b2Contact_IsValid(contactID));
-        const b2Manifold manifold = b2Contact_GetData(contactID).manifold;
-        ASSERT(manifold.pointCount == 1);
-
-        b2WeldJointDef jointDef = b2DefaultWeldJointDef();
-        const b2Rot projRot = b2Body_GetRotation(projectile->bodyID);
-        if (projIsShapeA) {
-            jointDef.base.bodyIdA = projectile->bodyID;
-            jointDef.base.bodyIdB = wall->bodyID;
-            const b2Rot relativeRot = b2MakeRot(b2RelativeAngle(wall->rot, projRot));
-            jointDef.base.localFrameA.p = b2InvRotateVector(projRot, manifold.points[0].anchorB);
-            jointDef.base.localFrameA.q = relativeRot;
-            jointDef.base.localFrameB.p = b2InvRotateVector(wall->rot, manifold.points[0].anchorA);
-            jointDef.base.localFrameB.q = relativeRot;
-        } else {
-            jointDef.base.bodyIdA = wall->bodyID;
-            jointDef.base.bodyIdB = projectile->bodyID;
-            const b2Rot relativeRot = b2MakeRot(b2RelativeAngle(projRot, wall->rot));
-            jointDef.base.localFrameA.p = b2InvRotateVector(wall->rot, manifold.points[0].anchorA);
-            jointDef.base.localFrameA.q = relativeRot;
-            jointDef.base.localFrameB.p = b2InvRotateVector(projRot, manifold.points[0].anchorB);
-            jointDef.base.localFrameB.q = relativeRot;
-        }
-        b2CreateWeldJoint(e->worldID, &jointDef);
-        projectile->velocity = b2Vec2_zero;
-        projectile->lastVelocity = b2Vec2_zero;
+        projectile->vel = fsVec2_zero;
+        projectile->lastVelocity = fsVec2_zero;
         projectile->speed = 0.0f;
         projectile->lastSpeed = 0.0f;
         projectile->setMine = true;
+        projectile->body->isStatic = true; // Stick to the wall
     }
 
     const uint8_t maxBounces = projectile->weaponInfo->maxBounces;
@@ -2560,152 +1833,67 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
     return 0;
 }
 
-// ensure speed is maintained when a projectile hits a dynamic body
 void handleProjectileEndContact(const entity *proj, const entity *ent) {
     projectileEntity *projectile = proj->entity;
     projectile->contacts--;
 
-    // mines stick to walls, explode when hitting another projectile
-    // and are destroyed when hitting a drone so no matter what we don't
-    // need to do anything here
-    if (projectile->weaponInfo->type == MINE_LAUNCHER_WEAPON) {
-        return;
-    }
+    if (projectile->weaponInfo->type == MINE_LAUNCHER_WEAPON) return;
 
-    if (ent != NULL) {
-        if (ent->type == PROJECTILE_ENTITY) {
-            const projectileEntity *projectile2 = ent->entity;
-            // allow projectile speeds to increase when two different
-            // projectile types collide
-            if (projectile->weaponInfo->type != projectile2->weaponInfo->type) {
-                b2Vec2 newVel = b2Body_GetLinearVelocity(projectile->bodyID);
-                float newSpeed = b2Length(newVel);
-                if (newSpeed < projectile->lastSpeed) {
-                    newSpeed = projectile->lastSpeed;
-                    newVel = b2MulSV(newSpeed, b2Normalize(newVel));
-                    b2Body_SetLinearVelocity(projectile->bodyID, newVel);
-                }
-                projectile->velocity = newVel;
-                projectile->speed = newSpeed;
-                projectile->lastSpeed = newSpeed;
-                return;
-            }
-        }
-    }
-
-    // the last speed is used here instead of the current speed because
-    // the current speed will be the speed box2d set the projectile to
-    // after a collision and we want to keep the speed consistent
     float newSpeed = projectile->lastSpeed;
     if (projectile->weaponInfo->type == ACCELERATOR_WEAPON) {
         newSpeed = min(projectile->lastSpeed * ACCELERATOR_BOUNCE_SPEED_COEF, ACCELERATOR_MAX_SPEED);
-        projectile->speed = newSpeed;
     }
 
-    // ensure the projectile's speed doesn't change after bouncing off
-    // something
-    b2Vec2 newVel = b2Body_GetLinearVelocity(projectile->bodyID);
-    newVel = b2MulSV(newSpeed, b2Normalize(newVel));
-    b2Body_SetLinearVelocity(projectile->bodyID, newVel);
-    projectile->velocity = newVel;
+    projectile->vel = fsMul(fsNormalize(projectile->vel), newSpeed);
     projectile->speed = newSpeed;
     projectile->lastSpeed = newSpeed;
 }
 
-// TODO: drone on drone collisions should reduce shield health
 void handleContactEvents(iwEnv *e) {
-    b2ContactEvents events = b2World_GetContactEvents(e->worldID);
-    for (int i = 0; i < events.beginCount; ++i) {
-        const b2ContactBeginTouchEvent *event = events.beginEvents + i;
-        entity *e1 = NULL;
-        entity *e2 = NULL;
+    for (int i = 0; i < e->world.numEvents; i++) {
+        const fsContactEvent *event = &e->world.events[i];
+        entity *e1 = event->a->userData;
+        entity *e2 = event->b->userData;
+        if (e1 == NULL || e2 == NULL) continue;
 
-        if (b2Shape_IsValid(event->shapeIdA)) {
-            e1 = b2Shape_GetUserData(event->shapeIdA);
-            ASSERT(e1 != NULL);
-        }
-        if (b2Shape_IsValid(event->shapeIdB)) {
-            e2 = b2Shape_GetUserData(event->shapeIdB);
-            ASSERT(e2 != NULL);
-        }
-
-        if (e1 != NULL && e1->type == DRONE_ENTITY && e2 != NULL && e2->type == DRONE_ENTITY) {
-            droneEntity *drone1 = e1->entity;
-            droneEntity *drone2 = e2->entity;
-
-            if (b2Contact_IsValid(event->contactId)) {
-                const b2Manifold manifold = b2Contact_GetData(event->contactId).manifold;
-                ASSERT(manifold.pointCount == 1);
-                b2Vec2 hitImpulse = b2MulSV(manifold.points[0].normalImpulse, manifold.normal);
-                trackImpulse(e, drone2->physicsTracking, hitImpulse, drone1->idx);
-                trackImpulse(e, drone1->physicsTracking, b2Neg(hitImpulse), drone2->idx);
-            }
-        }
-
-        if (e1 != NULL) {
+        if (event->type == FS_CONTACT_BEGIN) {
             if (e1->type == PROJECTILE_ENTITY) {
-                uint8_t numDestroyed = handleProjectileBeginContact(e, e1, e2, event->contactId, true);
-                if (numDestroyed == 2) {
-                    continue;
-                } else if (numDestroyed == 1) {
-                    e1 = NULL;
-                }
-
-            } else if (entityTypeIsWall(e1->type) && e2 != NULL) {
-                if (e1->type == DEATH_WALL_ENTITY) {
-                    if (e2->type == DRONE_ENTITY) {
-                        droneEntity *drone = e2->entity;
-                        const wallEntity *wall = e1->entity;
-                        killDrone(e, drone, wall);
-                    } else if (e2->type == SHIELD_ENTITY) {
-                        shieldEntity *shield = e2->entity;
-                        shield->health = 0.0f;
-                        destroyDroneShield(e, shield, true);
-                        e2 = NULL;
-                    }
-                }
+                handleProjectileBeginContact(e, e1, e2, 0, true);
+            } else if (e2->type == PROJECTILE_ENTITY) {
+                handleProjectileBeginContact(e, e2, e1, 0, false);
+            } else if (e1->type == DRONE_ENTITY && e2->type == DEATH_WALL_ENTITY) {
+                killDrone(e, e1->entity, e2->entity);
+            } else if (e2->type == DRONE_ENTITY && e1->type == DEATH_WALL_ENTITY) {
+                killDrone(e, e2->entity, e1->entity);
+            } else if (e1->type == WEAPON_PICKUP_ENTITY) {
+                handleWeaponPickupBeginTouch(e, e1, e2);
+            } else if (e2->type == WEAPON_PICKUP_ENTITY) {
+                handleWeaponPickupBeginTouch(e, e2, e1);
+            } else if (e1->type == PROJECTILE_ENTITY && event->a->isSensor) {
+                 handleProjectileBeginTouch(e, e1, e2);
+            } else if (e2->type == PROJECTILE_ENTITY && event->b->isSensor) {
+                 handleProjectileBeginTouch(e, e2, e1);
             }
-        }
-        if (e2 != NULL) {
-            if (e2->type == PROJECTILE_ENTITY) {
-                handleProjectileBeginContact(e, e2, e1, event->contactId, false);
-            } else if (entityTypeIsWall(e2->type) && e1 != NULL) {
-                if (e2->type == DEATH_WALL_ENTITY) {
-                    if (e1->type == DRONE_ENTITY) {
-                        droneEntity *drone = e1->entity;
-                        const wallEntity *wall = e2->entity;
-                        killDrone(e, drone, wall);
-                    } else if (e1->type == SHIELD_ENTITY) {
-                        shieldEntity *shield = e1->entity;
-                        shield->health = 0.0f;
-                        destroyDroneShield(e, shield, true);
-                    }
-                }
+        } else {
+            if (e1->type == PROJECTILE_ENTITY) {
+                handleProjectileEndContact(e1, e2);
+                if (event->a->isSensor) handleProjectileEndTouch(e, e1, e2);
+            } else if (e2->type == PROJECTILE_ENTITY) {
+                handleProjectileEndContact(e2, e1);
+                if (event->b->isSensor) handleProjectileEndTouch(e, e2, e1);
+            } else if (e1->type == WEAPON_PICKUP_ENTITY) {
+                handleWeaponPickupEndTouch(e1, e2);
+            } else if (e2->type == WEAPON_PICKUP_ENTITY) {
+                handleWeaponPickupEndTouch(e2, e1);
             }
         }
     }
-
-    for (int i = 0; i < events.endCount; ++i) {
-        const b2ContactEndTouchEvent *event = events.endEvents + i;
-        entity *e1 = NULL;
-        entity *e2 = NULL;
-        if (b2Shape_IsValid(event->shapeIdA)) {
-            e1 = b2Shape_GetUserData(event->shapeIdA);
-            ASSERT(e1 != NULL);
-        }
-        if (b2Shape_IsValid(event->shapeIdB)) {
-            e2 = b2Shape_GetUserData(event->shapeIdB);
-            ASSERT(e2 != NULL);
-        }
-        if (e1 != NULL && e1->type == PROJECTILE_ENTITY) {
-            handleProjectileEndContact(e1, e2);
-        }
-        if (e2 != NULL && e2->type == PROJECTILE_ENTITY) {
-            handleProjectileEndContact(e2, e1);
-        }
-    }
+    e->world.numEvents = 0;
 }
 
+void handleSensorEvents(iwEnv *e) {
+    // Sensors are handled as contacts in FastSim
+}
 // set pickup to respawn somewhere else randomly if a drone touched it,
 // mark the pickup as disabled if a floating wall is touching it
 void handleWeaponPickupBeginTouch(iwEnv *e, const entity *sensor, entity *visitor) {
@@ -2765,9 +1953,8 @@ void handleProjectileBeginTouch(iwEnv *e, const entity *sensor, entity *visitor)
         }
 
         ASSERT(visitor->type == DRONE_ENTITY);
-        const b2DistanceOutput output = closestPoint(sensor, visitor);
-        const b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE};
-        if (posBehindWall(e, projectile->pos, output.pointB, NULL, filter, NULL)) {
+        const fsDistanceOutput output = closestPoint(sensor, visitor);
+        if (posBehindWall(e, projectile->pos, fsAdd(projectile->pos, fsMul(output.normal, output.distance)), visitor, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
             const droneEntity *drone = visitor->entity;
             projectile->dronesBehindWalls[projectile->numDronesBehindWalls++] = drone->idx;
             return;
@@ -2787,7 +1974,13 @@ void handleProjectileBeginTouch(iwEnv *e, const entity *sensor, entity *visitor)
         // copy the entity ID so it won't be changed if the entity is
         // destroyed and reused later
         const entityID *visitorID = visitor->id;
-        entityID *id = fastCalloc(1, sizeof(entityID));
+        entityID *id = NULL;
+        if (cc_array_size(e->entityIdPool) > 0) {
+            cc_array_remove_last(e->entityIdPool, (void **)&id);
+            memset(id, 0, sizeof(entityID));
+        } else {
+            id = fastCalloc(1, sizeof(entityID));
+        }
         id->id = visitorID->id;
         id->generation = visitorID->generation;
         cc_array_add(projectile->entsInBlackHole, id);
@@ -2824,7 +2017,7 @@ void handleWeaponPickupEndTouch(const entity *sensor, entity *visitor) {
     }
 }
 
-void handleProjectileEndTouch(const entity *sensor, entity *visitor) {
+void handleProjectileEndTouch(iwEnv *e, const entity *sensor, entity *visitor) {
     projectileEntity *projectile = sensor->entity;
 
     switch (projectile->weaponInfo->type) {
@@ -2845,7 +2038,7 @@ void handleProjectileEndTouch(const entity *sensor, entity *visitor) {
         for (uint8_t i = 0; i < cc_array_size(projectile->entsInBlackHole); ++i) {
             entityID *id = safe_array_get_at(projectile->entsInBlackHole, i);
             if (id->id == visitorID->id) {
-                fastFree(id);
+                cc_array_add(e->entityIdPool, id);
                 cc_array_remove_fast_at(projectile->entsInBlackHole, i, NULL);
                 return;
             }
@@ -2853,61 +2046,6 @@ void handleProjectileEndTouch(const entity *sensor, entity *visitor) {
         break;
     default:
         ERRORF("invalid projectile type %d for end touch event", projectile->weaponInfo->type);
-    }
-}
-
-void handleSensorEvents(iwEnv *e) {
-    b2SensorEvents events = b2World_GetSensorEvents(e->worldID);
-    for (int i = 0; i < events.beginCount; ++i) {
-        const b2SensorBeginTouchEvent *event = events.beginEvents + i;
-        if (!b2Shape_IsValid(event->sensorShapeId)) {
-            DEBUG_LOG("could not find sensor shape for begin touch event");
-            continue;
-        }
-        entity *s = b2Shape_GetUserData(event->sensorShapeId);
-        ASSERT(s != NULL);
-
-        if (!b2Shape_IsValid(event->visitorShapeId)) {
-            DEBUG_LOG("could not find visitor shape for begin touch event");
-            continue;
-        }
-        entity *v = b2Shape_GetUserData(event->visitorShapeId);
-        ASSERT(v != NULL);
-
-        switch (s->type) {
-        case WEAPON_PICKUP_ENTITY:
-            handleWeaponPickupBeginTouch(e, s, v);
-            break;
-        case PROJECTILE_ENTITY:
-            handleProjectileBeginTouch(e, s, v);
-            break;
-        default:
-            ERRORF("unknown entity type %d for sensor begin touch event", s->type);
-        }
-    }
-
-    for (int i = 0; i < events.endCount; ++i) {
-        const b2SensorEndTouchEvent *event = events.endEvents + i;
-        if (!b2Shape_IsValid(event->sensorShapeId)) {
-            DEBUG_LOG("could not find sensor shape for end touch event");
-            continue;
-        }
-        entity *s = b2Shape_GetUserData(event->sensorShapeId);
-        ASSERT(s != NULL);
-        entity *v = NULL;
-        if (b2Shape_IsValid(event->visitorShapeId)) {
-            v = b2Shape_GetUserData(event->visitorShapeId);
-            ASSERT(v != NULL);
-        }
-
-        if (s->type == PROJECTILE_ENTITY) {
-            handleProjectileEndTouch(s, v);
-            continue;
-        }
-
-        if (v != NULL) {
-            handleWeaponPickupEndTouch(s, v);
-        }
     }
 }
 
@@ -2919,10 +2057,40 @@ void findNearWalls(const iwEnv *e, const droneEntity *drone, nearEntity nearestW
         const uint16_t wallIdx = e->map->nearestWalls[idx].idx;
         wallEntity *wall = safe_array_get_at(e->walls, wallIdx);
         nearWalls[i].entity = wall;
-        nearWalls[i].distanceSquared = b2DistanceSquared(drone->pos, wall->pos);
+        nearWalls[i].distanceSquared = fsDistanceSq(drone->pos, wall->pos);
     }
     insertionSort(nearWalls, MAX_NEAREST_WALLS);
     memcpy(nearestWalls, nearWalls, nWalls * sizeof(nearEntity));
 }
 
+void dampTrackedPhysics(iwEnv *e) {
+    for (uint8_t i = 0; i < e->numDrones; i++) {
+        droneEntity *drone = safe_array_get_at(e->drones, i);
+        if (drone->dead) {
+            continue;
+        }
+
+        float droneDamping = DRONE_LINEAR_DAMPING;
+        if (drone->braking) {
+            droneDamping *= DRONE_BRAKE_DAMPING_COEF;
+        }
+
+        const float damp = 1.0f / (1.0f + (droneDamping * e->deltaTime));
+        for (uint8_t k = 0; k < e->numDrones; k++) {
+            drone->contributions[k] = fsMul(damp, drone->contributions[k]);
+        }
+    }
+
+    CC_ArrayIter wallIter;
+    cc_array_iter_init(&wallIter, e->floatingWalls);
+    wallEntity *wall;
+    while (cc_array_iter_next(&wallIter, (void **)&wall) != CC_ITER_END) {
+        const float damp = 1.0f / (1.0f + (FLOATING_WALL_DAMPING * e->deltaTime));
+        for (uint8_t k = 0; k < e->numDrones; k++) {
+            wall->contributions[k] = fsMul(damp, wall->contributions[k]);
+        }
+    }
+}
+
 #endif
+

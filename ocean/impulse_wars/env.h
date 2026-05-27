@@ -18,14 +18,68 @@ double accumulator = 0.0;
 const uint8_t THREE_BIT_MASK = 0x7;
 const uint8_t FOUR_BIT_MASK = 0xf;
 
+// Select up to K nearest projectiles to an agent without sorting the full list.
+// This keeps per-step work bounded by O(numProjectiles * K) instead of O(numProjectiles^2).
+static inline size_t selectNearestProjectiles(const fsVec2 agentPos, projectileEntity *const *projectiles, const size_t numProjectiles,
+                                              projectileEntity **out, float *outDist2, const size_t K) {
+    size_t filled = 0;
+    for (size_t i = 0; i < K; i++) {
+        out[i] = NULL;
+        outDist2[i] = FLT_MAX;
+    }
+
+    for (size_t i = 0; i < numProjectiles; i++) {
+        projectileEntity *p = projectiles[i];
+        const float d2 = fsDistanceSq(agentPos, p->pos);
+
+        // Fast reject: if we already have K entries and this is worse than the current worst, skip.
+        if (filled == K && d2 >= outDist2[K - 1]) {
+            continue;
+        }
+
+        // Insert into sorted [0..filled) by distance (ascending).
+        size_t j = filled;
+        if (j > K - 1) {
+            j = K - 1;
+        } else {
+            filled++;
+        }
+
+        while (j > 0 && outDist2[j - 1] > d2) {
+            outDist2[j] = outDist2[j - 1];
+            out[j] = out[j - 1];
+            j--;
+        }
+        outDist2[j] = d2;
+        out[j] = p;
+    }
+
+    return filled;
+}
+
 // pufferlib compatibility
 #define c_step stepEnv
 #define c_reset resetEnv
-#define c_render setupRayClient
 #define c_close destroyEnv
 
+// In Puffer, render() is expected to draw a frame, not just initialize rendering.
+// `setupRayClient()` only creates the window/client and flags a reset; it does not
+// call BeginDrawing()/renderEnv(). That manifests as a black screen in eval.
+static inline void c_render(iwEnv *e) {
+    setupRayClient(e);
+    if (e->client == NULL || e->map == NULL || e->drones == NULL) {
+        return;
+    }
+
+    // If the window is created after setupEnv() already ran, we still need a camera.
+    setupEnvCamera(e);
+
+    // Draw a frame immediately (even before the next step()).
+    renderEnv(e, false, false, -1, -1);
+}
+
 // returns a cell index that is closest to pos that isn't cellIdx
-uint16_t findNearestCell(const iwEnv *e, const b2Vec2 pos, const uint16_t cellIdx) {
+uint16_t findNearestCell(const iwEnv *e, const fsVec2 pos, const uint16_t cellIdx) {
     uint16_t closestCell = cellIdx;
     float minDistance = FLT_MAX;
     const uint8_t cellCol = cellIdx / e->map->columns;
@@ -41,7 +95,7 @@ uint16_t findNearestCell(const iwEnv *e, const b2Vec2 pos, const uint16_t cellId
         }
         const int16_t newCellIdx = cellIndex(e, newCellCol, newCellRow);
         const mapCell *cell = safe_array_get_at(e->cells, newCellIdx);
-        if (minDistance != min(minDistance, b2DistanceSquared(pos, cell->pos))) {
+        if (minDistance != min(minDistance, fsDistanceSq(pos, cell->pos))) {
             closestCell = newCellIdx;
         }
     }
@@ -210,7 +264,7 @@ void computeNearObs(iwEnv *e, const droneEntity *drone, const uint16_t discreteO
 
         offset = NEAR_WALL_POS_OBS_OFFSET + (i * NEAR_WALL_POS_OBS_SIZE);
         ASSERTF(offset <= FLOATING_WALL_INFO_OBS_OFFSET, "offset: %d", offset);
-        const b2Vec2 wallRelPos = b2Sub(wall->pos, drone->pos);
+        const fsVec2 wallRelPos = fsSub(wall->pos, drone->pos);
 
         continuousObs[offset++] = scaleValue(wallRelPos.x, MAX_X_POS, false);
         continuousObs[offset] = scaleValue(wallRelPos.y, MAX_Y_POS, false);
@@ -223,7 +277,7 @@ void computeNearObs(iwEnv *e, const droneEntity *drone, const uint16_t discreteO
             wallEntity *wall = safe_array_get_at(e->floatingWalls, i);
             const nearEntity nearEnt = {
                 .entity = wall,
-                .distanceSquared = b2DistanceSquared(wall->pos, drone->pos),
+                .distanceSquared = fsDistanceSq(wall->pos, drone->pos),
             };
             nearFloatingWalls[i] = nearEnt;
         }
@@ -236,9 +290,8 @@ void computeNearObs(iwEnv *e, const droneEntity *drone, const uint16_t discreteO
             }
             const wallEntity *wall = nearFloatingWalls[i].entity;
 
-            const b2Transform wallTransform = b2Body_GetTransform(wall->bodyID);
-            const b2Vec2 wallRelPos = b2Sub(wallTransform.p, drone->pos);
-            const float angle = b2Rot_GetAngle(wallTransform.q);
+            const fsVec2 wallRelPos = fsSub(wall->body->pos, drone->pos);
+            const float angle = wall->body->angle;
 
             offset = discreteObsStart + FLOATING_WALL_TYPES_OBS_OFFSET + i;
             ASSERTF(offset <= discreteObsStart + PROJECTILE_DRONE_OBS_OFFSET, "offset: %d", offset);
@@ -263,7 +316,7 @@ void computeNearObs(iwEnv *e, const droneEntity *drone, const uint16_t discreteO
             weaponPickupEntity *pickup = safe_array_get_at(e->pickups, i);
             const nearEntity nearEnt = {
                 .entity = pickup,
-                .distanceSquared = b2DistanceSquared(pickup->pos, drone->pos),
+                .distanceSquared = fsDistanceSq(pickup->pos, drone->pos),
             };
             nearPickups[i] = nearEnt;
         }
@@ -284,7 +337,7 @@ void computeNearObs(iwEnv *e, const droneEntity *drone, const uint16_t discreteO
 
             offset = WEAPON_PICKUP_POS_OBS_OFFSET + (i * WEAPON_PICKUP_POS_OBS_SIZE);
             ASSERTF(offset <= PROJECTILE_INFO_OBS_OFFSET, "offset: %d", offset);
-            const b2Vec2 pickupRelPos = b2Sub(pickup->pos, drone->pos);
+            const fsVec2 pickupRelPos = fsSub(pickup->pos, drone->pos);
             continuousObs[offset++] = scaleValue(pickupRelPos.x, MAX_X_POS, false);
             continuousObs[offset] = scaleValue(pickupRelPos.y, MAX_Y_POS, false);
         }
@@ -313,32 +366,21 @@ void computeObs(iwEnv *e) {
 
         computeNearObs(e, agentDrone, discreteObsStart, continuousObs);
 
-        // sort projectiles by distance to the current agent
-        const b2Vec2 agentPos = agentDrone->pos;
+        // select nearest projectiles to the current agent (bounded work; no full sort)
+        const fsVec2 agentPos = agentDrone->pos;
         const size_t numProjectiles = cc_array_size(e->projectiles);
         if (numProjectiles > 0) {
-            projectileEntity *sortedProjectiles[numProjectiles];
-            memcpy(sortedProjectiles, e->projectiles->buffer, numProjectiles * sizeof(projectileEntity *));
-
-            for (int16_t i = 1; i < (int64_t)numProjectiles; i++) {
-                projectileEntity *key = sortedProjectiles[i];
-                const float keyDistance = b2DistanceSquared(agentPos, key->pos);
-                int16_t j = i - 1;
-
-                while (j >= 0 && b2DistanceSquared(agentPos, sortedProjectiles[j]->pos) > keyDistance) {
-                    sortedProjectiles[j + 1] = sortedProjectiles[j];
-                    j = j - 1;
-                }
-
-                sortedProjectiles[j + 1] = key;
-            }
+            projectileEntity *nearest[NUM_PROJECTILE_OBS];
+            float nearestDist2[NUM_PROJECTILE_OBS];
+            const size_t selected = selectNearestProjectiles(agentPos, (projectileEntity *const *)e->projectiles->buffer, numProjectiles,
+                                                             nearest, nearestDist2, NUM_PROJECTILE_OBS);
 
             // compute type and location of N projectiles
-            for (size_t i = 0; i < numProjectiles; i++) {
-                if (i == NUM_PROJECTILE_OBS) {
+            for (size_t i = 0; i < selected; i++) {
+                const projectileEntity *projectile = nearest[i];
+                if (projectile == NULL) {
                     break;
                 }
-                const projectileEntity *projectile = sortedProjectiles[i];
 
                 discreteObsOffset = discreteObsStart + PROJECTILE_DRONE_OBS_OFFSET + i;
                 ASSERTF(discreteObsOffset <= discreteObsStart + PROJECTILE_WEAPONS_OBS_OFFSET, "offset: %d", discreteObsOffset);
@@ -350,7 +392,7 @@ void computeObs(iwEnv *e) {
 
                 continuousObsOffset = PROJECTILE_INFO_OBS_OFFSET + (i * PROJECTILE_INFO_OBS_SIZE);
                 ASSERTF(continuousObsOffset <= ENEMY_DRONE_OBS_OFFSET, "offset: %d", continuousObsOffset);
-                const b2Vec2 projectileRelPos = b2Sub(projectile->pos, agentDrone->pos);
+                const fsVec2 projectileRelPos = fsSub(projectile->pos, agentDrone->pos);
                 continuousObs[continuousObsOffset++] = scaleValue(projectileRelPos.x, MAX_X_POS, false);
                 continuousObs[continuousObsOffset++] = scaleValue(projectileRelPos.y, MAX_Y_POS, false);
                 continuousObs[continuousObsOffset++] = scaleValue(projectile->velocity.x, MAX_SPEED, false);
@@ -380,10 +422,10 @@ void computeObs(iwEnv *e) {
                 continue;
             }
 
-            const b2Vec2 enemyDroneRelPos = b2Sub(enemyDrone->pos, agentDrone->pos);
-            const float enemyDroneDistance = b2Distance(enemyDrone->pos, agentDrone->pos);
-            const b2Vec2 enemyDroneAccel = b2Sub(enemyDrone->velocity, enemyDrone->lastVelocity);
-            const b2Vec2 enemyDroneRelNormPos = b2Normalize(b2Sub(enemyDrone->pos, agentDrone->pos));
+            const fsVec2 enemyDroneRelPos = fsSub(enemyDrone->pos, agentDrone->pos);
+            const float enemyDroneDistanceSquared = fsDistanceSq(enemyDrone->pos, agentDrone->pos);
+            const fsVec2 enemyDroneAccel = fsSub(enemyDrone->velocity, enemyDrone->lastVelocity);
+            const fsVec2 enemyDroneRelNormPos = fsNormalize(fsSub(enemyDrone->pos, agentDrone->pos));
             const float enemyDroneAimAngle = atan2f(enemyDrone->lastAim.y, enemyDrone->lastAim.x);
             float enemyDroneBraking = 0.0f;
             if (enemyDrone->braking) {
@@ -397,7 +439,7 @@ void computeObs(iwEnv *e) {
             continuousObs[continuousObsOffset++] = enemyDrone->team == agentDrone->team;
             continuousObs[continuousObsOffset++] = scaleValue(enemyDroneRelPos.x, MAX_X_POS, false);
             continuousObs[continuousObsOffset++] = scaleValue(enemyDroneRelPos.y, MAX_Y_POS, false);
-            continuousObs[continuousObsOffset++] = scaleValue(enemyDroneDistance, MAX_DISTANCE, true);
+            continuousObs[continuousObsOffset++] = scaleValue(enemyDroneDistanceSquared, SQUARED(MAX_DISTANCE), true);
             continuousObs[continuousObsOffset++] = scaleValue(enemyDrone->velocity.x, MAX_SPEED, false);
             continuousObs[continuousObsOffset++] = scaleValue(enemyDrone->velocity.y, MAX_SPEED, false);
             continuousObs[continuousObsOffset++] = scaleValue(enemyDroneAccel.x, MAX_ACCEL, false);
@@ -425,7 +467,7 @@ void computeObs(iwEnv *e) {
 
         // compute active drone observations
         continuousObsOffset = ENEMY_DRONE_OBS_OFFSET + ((e->numDrones - 1) * ENEMY_DRONE_OBS_SIZE);
-        const b2Vec2 agentDroneAccel = b2Sub(agentDrone->velocity, agentDrone->lastVelocity);
+        const fsVec2 agentDroneAccel = fsSub(agentDrone->velocity, agentDrone->lastVelocity);
         float agentDroneBraking = 0.0f;
         if (agentDrone->braking) {
             agentDroneBraking = 1.0f;
@@ -514,12 +556,12 @@ void setupEnv(iwEnv *e) {
 // the frame rate
 void setEnvFrameRate(iwEnv *e) {
     float frameRate = TRAINING_FRAME_RATE;
-    e->box2dSubSteps = TRAINING_BOX2D_SUBSTEPS;
+    e->physicsSubSteps = TRAINING_BOX2D_SUBSTEPS;
     // set a higher frame rate and physics substeps when evaluating
     // to make it more enjoyable to play
     if (!e->isTraining) {
         frameRate = EVAL_FRAME_RATE;
-        e->box2dSubSteps = EVAL_BOX2D_SUBSTEPS;
+        e->physicsSubSteps = EVAL_BOX2D_SUBSTEPS;
     }
 
     e->frameRate = frameRate;
@@ -568,13 +610,11 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     e->randState = seed;
     e->needsReset = false;
 
-    b2WorldDef worldDef = b2DefaultWorldDef();
-    worldDef.gravity = (b2Vec2){.x = 0.0f, .y = 0.0f};
-    e->worldID = b2CreateWorld(&worldDef);
+    fsWorld_Init(&e->world);
     e->pinnedMapIdx = mapIdx;
     e->mapIdx = -1;
 
-    e->idPool = b2CreateIdPool();
+    // Use custom id pool if needed, but for now we just use createEntity
     create_array(&e->entities, 128);
 
     create_array(&e->cells, 512);
@@ -586,6 +626,13 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     create_array(&e->explosions, 8);
     create_array(&e->explodingProjectiles, 8);
     create_array(&e->dronePieces, 16);
+
+    create_array(&e->projectilePool, 128);
+    create_array(&e->dronePiecePool, 128);
+    create_array(&e->explosionPool, 32);
+    create_array(&e->brakeTrailPointPool, 128);
+    create_array(&e->entityIdPool, 128);
+
 
     e->mapPathing = fastCalloc(NUM_MAPS, sizeof(pathingInfo));
     for (uint8_t i = 0; i < NUM_MAPS; i++) {
@@ -653,7 +700,8 @@ void clearEnv(iwEnv *e) {
 
     for (size_t i = 0; i < cc_array_size(e->explosions); i++) {
         explosionInfo *explosion = safe_array_get_at(e->explosions, i);
-        fastFree(explosion);
+        // keep around for reuse; explosions are created frequently when rendering
+        cc_array_add(e->explosionPool, explosion);
     }
 
     for (size_t i = 0; i < cc_array_size(e->dronePieces); i++) {
@@ -695,7 +743,6 @@ void destroyEnv(iwEnv *e) {
         fastFree(ent->id);
         fastFree(ent);
     }
-    b2DestroyIdPool(&e->idPool);
 
     cc_array_destroy(e->entities);
     cc_array_destroy(e->cells);
@@ -708,7 +755,41 @@ void destroyEnv(iwEnv *e) {
     cc_array_destroy(e->explodingProjectiles);
     cc_array_destroy(e->dronePieces);
 
-    b2DestroyWorld(e->worldID);
+    for (size_t i = 0; i < cc_array_size(e->projectilePool); i++) {
+        void *p;
+        cc_array_get_at(e->projectilePool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->projectilePool);
+
+    for (size_t i = 0; i < cc_array_size(e->dronePiecePool); i++) {
+        void *p;
+        cc_array_get_at(e->dronePiecePool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->dronePiecePool);
+
+    for (size_t i = 0; i < cc_array_size(e->explosionPool); i++) {
+        void *p;
+        cc_array_get_at(e->explosionPool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->explosionPool);
+
+    for (size_t i = 0; i < cc_array_size(e->brakeTrailPointPool); i++) {
+        void *p;
+        cc_array_get_at(e->brakeTrailPointPool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->brakeTrailPointPool);
+
+    for (size_t i = 0; i < cc_array_size(e->entityIdPool); i++) {
+        void *p;
+        cc_array_get_at(e->entityIdPool, i, &p);
+        fastFree(p);
+    }
+    cc_array_destroy(e->entityIdPool);
+
 
 #ifndef NDEBUG
     cc_array_destroy(e->debugPoints);
@@ -777,9 +858,9 @@ float computeReward(iwEnv *e, droneEntity *drone) {
             continue;
         }
 
-        // const b2Vec2 enemyDirection = b2Normalize(b2Sub(enemyDrone->pos, drone->pos));
-        // const float velocityToEnemy = b2Dot(drone->lastVelocity, enemyDirection);
-        // const float enemyDistance = b2Distance(enemyDrone->pos, drone->pos);
+        // const fsVec2 enemyDirection = fsNormalize(fsSub(enemyDrone->pos, drone->pos));
+        // const float velocityToEnemy = fsDot(drone->lastVelocity, enemyDirection);
+        // const float enemyDistance = fsDistance(enemyDrone->pos, drone->pos);
         // // stop rewarding approaching an enemy if they're very close
         // // to avoid constant clashing; always reward approaching when
         // // the current weapon is the shotgun, it greatly benefits from
@@ -818,8 +899,8 @@ void computeRewards(iwEnv *e, const bool roundOver, const int8_t winner, const i
     }
 }
 
-static inline bool isActionNoop(const b2Vec2 action) {
-    return b2Length(action) < ACTION_NOOP_MAGNITUDE;
+static inline bool isActionNoop(const fsVec2 action) {
+    return fsLength(action) < ACTION_NOOP_MAGNITUDE;
 }
 
 agentActions _computeActions(iwEnv *e, droneEntity *drone, const agentActions *manualActions) {
@@ -827,8 +908,8 @@ agentActions _computeActions(iwEnv *e, droneEntity *drone, const agentActions *m
 
     const uint8_t offset = drone->idx * CONTINUOUS_ACTION_SIZE;
     if (manualActions == NULL) {
-        actions.move = (b2Vec2){.x = e->actions[offset + 0], .y = e->actions[offset + 1]};
-        actions.aim = (b2Vec2){.x = e->actions[offset + 2], .y = e->actions[offset + 3]};
+        actions.move = (fsVec2){.x = e->actions[offset + 0], .y = e->actions[offset + 1]};
+        actions.aim = (fsVec2){.x = e->actions[offset + 2], .y = e->actions[offset + 3]};
         if (e->continuousActions) {
             actions.move.x = tanhf(actions.move.x);
             actions.move.y = tanhf(actions.move.y);
@@ -853,16 +934,18 @@ agentActions _computeActions(iwEnv *e, droneEntity *drone, const agentActions *m
     }
 
     // cap movement magnitude to 1.0
-    if (b2Length(actions.move) > 1.0f) {
-        actions.move = b2Normalize(actions.move);
-    } else if (isActionNoop(actions.move)) {
-        actions.move = b2Vec2_zero;
+    if (fsLength(actions.move) > 1.0f) {
+        actions.move = fsNormalize(actions.move);
+    }
+
+    if (fsLength(actions.aim) > 1.0f) {
+        actions.aim = fsNormalize(actions.aim);
     }
 
     if (isActionNoop(actions.aim)) {
-        actions.aim = b2Vec2_zero;
+        actions.aim = fsVec2_zero;
     } else {
-        actions.aim = b2Normalize(actions.aim);
+        actions.aim = fsNormalize(actions.aim);
     }
 
     return actions;
@@ -871,7 +954,7 @@ agentActions _computeActions(iwEnv *e, droneEntity *drone, const agentActions *m
 agentActions computeActions(iwEnv *e, droneEntity *drone, const agentActions *manualActions) {
     const agentActions actions = _computeActions(e, drone, manualActions);
     drone->lastMove = actions.move;
-    if (!b2VecEqual(actions.aim, b2Vec2_zero)) {
+    if (!fsVecEqual(actions.aim, fsVec2_zero)) {
         drone->lastAim = actions.aim;
     }
     return actions;
@@ -950,15 +1033,15 @@ agentActions getPlayerInputs(iwEnv *e, droneEntity *drone, uint8_t gamepadIdx) {
             actions.discardWeapon = true;
         }
 
-        actions.move = (b2Vec2){.x = lStickX, .y = lStickY};
-        actions.aim = (b2Vec2){.x = rStickX, .y = rStickY};
+        actions.move = (fsVec2){.x = lStickX, .y = lStickY};
+        actions.aim = (fsVec2){.x = rStickX, .y = rStickY};
         return computeActions(e, drone, &actions);
     }
     if (!controllerConnected && drone->idx != e->humanDroneInput) {
         return actions;
     }
 
-    b2Vec2 move = b2Vec2_zero;
+    fsVec2 move = fsVec2_zero;
     if (IsKeyDown(KEY_W)) {
         move.y += -1.0f;
     }
@@ -971,10 +1054,10 @@ agentActions getPlayerInputs(iwEnv *e, droneEntity *drone, uint8_t gamepadIdx) {
     if (IsKeyDown(KEY_D)) {
         move.x += 1.0f;
     }
-    actions.move = b2Normalize(move);
+    actions.move = fsNormalize(move);
 
     Vector2 mousePos = (Vector2){.x = (float)GetMouseX(), .y = (float)GetMouseY()};
-    actions.aim = b2Normalize(b2Sub(rayVecToB2Vec(e, mousePos), drone->pos));
+    actions.aim = fsNormalize(fsSub(rayVecToFsVec(e, mousePos), drone->pos));
 
     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         actions.chargingWeapon = true;
@@ -1136,25 +1219,26 @@ void stepEnv(iwEnv *e) {
                 } else if (drone->chargingBurst) {
                     droneBurst(e, drone);
                 }
-                if (!b2VecEqual(actions.move, b2Vec2_zero)) {
+                if (!fsVecEqual(actions.move, fsVec2_zero)) {
                     droneMove(e, drone, actions.move);
                 }
                 droneBrake(e, drone, actions.brake);
 
-                // update shield velocity if its active
+                // update shield velocity/pos if its active
                 if (drone->shield != NULL) {
-                    b2Body_SetLinearVelocity(drone->shield->bodyID, b2Body_GetLinearVelocity(drone->bodyID));
+                    drone->shield->body->pos = drone->body->pos;
+                    drone->shield->body->vel = drone->body->vel;
                 }
             }
 
-            b2World_Step(e->worldID, e->deltaTime, e->box2dSubSteps);
+            fsWorld_Step(&e->world, e->deltaTime);
+            dampTrackedPhysics(e);
 
             // update dynamic body positions and velocities
             handleBodyMoveEvents(e);
 
             // handle collisions
             handleContactEvents(e);
-            handleSensorEvents(e);
 
             // handle sudden death
             e->stepsLeft = max(e->stepsLeft - 1, 0);
@@ -1254,7 +1338,7 @@ void stepEnv(iwEnv *e) {
                         e->stats[i].wins = 1.0f;
                     }
                     // set absolute distance traveled of agent drones
-                    e->stats[i].absDistanceTraveled = b2Distance(drone->initalPos, drone->pos);
+                    e->stats[i].absDistanceTraveled = fsDistance(drone->initalPos, drone->pos);
                 }
 
                 memcpy(log.stats, e->stats, sizeof(e->stats));

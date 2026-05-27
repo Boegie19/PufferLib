@@ -1,7 +1,8 @@
 #ifndef IMPULSE_WARS_TYPES_H
 #define IMPULSE_WARS_TYPES_H
 
-#include "box2d/box2d.h"
+#include "fast_sim.h"
+#include "fs_compat.h"
 #include "id_pool.h"
 #include "raylib.h"
 #include "rlights.h"
@@ -71,8 +72,8 @@ enum weaponType {
 };
 
 typedef struct mapBounds {
-    b2Vec2 min;
-    b2Vec2 max;
+    fsVec2 min;
+    fsVec2 max;
 } mapBounds;
 
 // used for N near entities observations
@@ -105,21 +106,20 @@ typedef struct mapEntry {
 // a cell in the map; ent will be NULL if the cell is empty
 typedef struct mapCell {
     entity *ent;
-    b2Vec2 pos;
+    fsVec2 pos;
 } mapCell;
 
 typedef struct wallEntity {
-    b2BodyId bodyID;
-    b2ShapeId shapeID;
-    b2Vec2 pos;
-    b2Rot rot;
-    b2Vec2 velocity;
-    b2Vec2 extent;
+    fsBody *body;
+    fsVec2 pos;
+    fsRot rot;
+    fsVec2 velocity;
+    fsVec2 extent;
     int16_t mapCellIdx;
     bool isFloating;
     enum entityType type;
     bool isSuddenDeath;
-    CC_Array *physicsTracking;
+    fsVec2 contributions[_MAX_DRONES];
 
     entity *ent;
 } wallEntity;
@@ -156,13 +156,12 @@ typedef struct weaponInformation {
 } weaponInformation;
 
 typedef struct weaponPickupEntity {
-    b2BodyId bodyID;
-    b2ShapeId shapeID;
+    fsBody *body;
     enum weaponType weapon;
     float respawnWait;
     // how many floating walls are touching this pickup
     uint8_t floatingWallsTouching;
-    b2Vec2 pos;
+    fsVec2 pos;
     int16_t mapCellIdx;
 
     entity *ent;
@@ -179,16 +178,14 @@ typedef struct trailPoints {
 typedef struct projectileEntity {
     uint8_t droneIdx;
 
-    b2BodyId bodyID;
-    b2ShapeId shapeID;
-    // used for proximity explosive projectiles
-    b2ShapeId sensorID;
+    fsBody *body;
+    fsBody *sensor;
     weaponInformation *weaponInfo;
-    b2Vec2 pos;
+    fsVec2 pos;
     int16_t mapCellIdx;
-    b2Vec2 lastPos;
-    b2Vec2 velocity;
-    b2Vec2 lastVelocity;
+    fsVec2 lastPos;
+    fsVec2 velocity;
+    fsVec2 lastVelocity;
     float speed;
     float lastSpeed;
     float distance;
@@ -222,10 +219,8 @@ typedef struct droneStepInfo {
 typedef struct shieldEntity {
     droneEntity *drone;
 
-    b2BodyId bodyID;
-    b2ShapeId shapeID;
-    b2ShapeId bufferShapeID;
-    b2Vec2 pos;
+    fsBody *body;
+    fsVec2 pos;
     float health;
     float duration;
 
@@ -235,11 +230,10 @@ typedef struct shieldEntity {
 typedef struct dronePieceEntity {
     uint8_t droneIdx;
 
-    b2BodyId bodyID;
-    b2ShapeId shapeID;
-    b2Vec2 pos;
-    b2Rot rot;
-    b2Vec2 vertices[3];
+    fsBody *body;
+    fsVec2 pos;
+    fsRot rot;
+    fsVec2 vertices[3];
     bool isShieldPiece;
 
     entity *ent;
@@ -247,17 +241,10 @@ typedef struct dronePieceEntity {
     uint16_t lifetime;
 } dronePieceEntity;
 
-typedef struct physicsStepInfo {
-    uint8_t srcIdx;
-    b2Vec2 impulse;
-    b2Vec2 force;
-    bool brakeToggled;
-    uint16_t step;
-} physicsStepInfo;
+
 
 typedef struct droneEntity {
-    b2BodyId bodyID;
-    b2ShapeId shapeID;
+    fsBody *body;
     weaponInformation *weaponInfo;
     int8_t ammo;
     float weaponCooldown;
@@ -277,20 +264,20 @@ typedef struct droneEntity {
 
     uint8_t idx;
     uint8_t team;
-    b2Vec2 initalPos;
-    b2Vec2 pos;
+    fsVec2 initalPos;
+    fsVec2 pos;
     int16_t mapCellIdx;
-    b2Vec2 lastPos;
-    b2Vec2 lastMove;
-    b2Vec2 lastAim;
-    b2Vec2 velocity;
-    b2Vec2 lastVelocity;
+    fsVec2 lastPos;
+    fsVec2 lastMove;
+    fsVec2 lastAim;
+    fsVec2 velocity;
+    fsVec2 lastVelocity;
     droneStepInfo stepInfo;
     float respawnWait;
     uint8_t livesLeft;
     bool dead;
 
-    CC_Array *physicsTracking;
+    fsVec2 contributions[_MAX_DRONES];
     int8_t killedBy;
     bool killed[_MAX_DRONES];
 
@@ -378,21 +365,22 @@ typedef struct rayClient {
 } rayClient;
 
 typedef struct brakeTrailPoint {
-    b2Vec2 pos;
+    fsVec2 pos;
     uint16_t lifetime;
     bool isEnd;
 } brakeTrailPoint;
 
 typedef struct explosionInfo {
-    b2ExplosionDef def;
+    float radius;
+    float impulsePerLength;
     bool isBurst;
     uint8_t droneIdx;
     uint16_t renderSteps;
 } explosionInfo;
 
 typedef struct agentActions {
-    b2Vec2 move;
-    b2Vec2 aim;
+    fsVec2 move;
+    fsVec2 aim;
     bool chargingWeapon;
     bool shoot;
     bool brake;
@@ -406,7 +394,7 @@ typedef struct pathingInfo {
 } pathingInfo;
 
 typedef struct debugPoint {
-    b2Vec2 pos;
+    fsVec2 pos;
     float size;
     Color color;
 } debugPoint;
@@ -446,7 +434,7 @@ typedef struct iwEnv {
     uint8_t frameRate;
     float deltaTime;
     uint8_t frameSkip;
-    uint8_t box2dSubSteps;
+    uint8_t physicsSubSteps;
     uint64_t randState;
     bool needsReset;
 
@@ -454,14 +442,13 @@ typedef struct iwEnv {
     Log log;
     droneStats stats[_MAX_DRONES];
 
-    b2WorldId worldID;
+    fsWorld world;
     int8_t pinnedMapIdx;
     int8_t mapIdx;
     mapEntry *map;
     int8_t lastSpawnQuad;
     uint8_t spawnedWeaponPickups[_NUM_WEAPONS];
     weaponInformation *defaultWeapon;
-    b2IdPool idPool;
     CC_Array *entities;
     CC_Array *cells;
     CC_Array *walls;
@@ -492,7 +479,13 @@ typedef struct iwEnv {
     rayClient *client;
     float renderScale;
     CC_Array *explosions;
+    CC_Array *projectilePool;
+    CC_Array *dronePiecePool;
+    CC_Array *explosionPool;
+    CC_Array *brakeTrailPointPool;
+    CC_Array *entityIdPool;
     CC_Array *debugPoints;
+
 } iwEnv;
 
 #endif

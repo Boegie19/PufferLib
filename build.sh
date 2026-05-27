@@ -109,15 +109,7 @@ elif [ "$ENV" = "trailer" ]; then
     OUTPUT_NAME="trailer/trailer"
 elif [ "$ENV" = "impulse_wars" ]; then
     SRC_DIR="ocean/$ENV"
-    if [ "$MODE" = "web" ]; then BOX2D_NAME='box2d-web'
-    elif [ "$PLATFORM" = "Linux" ]; then BOX2D_NAME='box2d-linux-amd64'
-    else BOX2D_NAME='box2d-macos-arm64'
-    fi
-    BOX2D_URL="https://github.com/capnspacehook/box2d/releases/latest/download"
-    download "$BOX2D_NAME" "$BOX2D_URL/$BOX2D_NAME.tar.gz"
-    INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src)
-    LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
-    EXTRA_LDFLAGS+=(-L"./$BOX2D_NAME" -lbox2d -Wl,-rpath,"./$BOX2D_NAME" -ldl)
+    # Box2D removed in favor of FastSim
 elif [ "$ENV" = "nethack" ]; then
     SRC_DIR="ocean/$ENV"
     NLE_DIR="vendor/nle"
