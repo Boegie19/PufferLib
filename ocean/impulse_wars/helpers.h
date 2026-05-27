@@ -113,7 +113,7 @@
 // heap memory, use dlmalloc in release mode for performance; emscripten
 // uses dlmalloc by default so no need to change anything here; dlmalloc
 // sometimes won't compile on macOS so just use malloc and friends
-#if !defined(NDEBUG) || defined(__EMSCRIPTEN__) || defined(__APPLE__)
+#if !defined(NDEBUG) || defined(__EMSCRIPTEN__) || defined(__APPLE__) || defined(__linux__)
 #define fastMalloc(size) malloc(size)
 #define fastMallocFn malloc
 #define fastCalloc(nmemb, size) calloc(nmemb, size)
