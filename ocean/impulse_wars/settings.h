@@ -29,6 +29,9 @@ const float DRONE_RESPAWN_WAIT = 2.0f;
 const uint8_t ROUND_STEPS = 90;
 const uint8_t SUDDEN_DEATH_STEPS = 5;
 
+#ifndef _MAX_DRONES
+#define _MAX_DRONES 4
+#endif
 const uint8_t MAX_DRONES = _MAX_DRONES;
 
 const uint16_t LOG_BUFFER_SIZE = 1024;
@@ -113,7 +116,9 @@ uint16_t continuousObsSize(uint8_t numDrones) {
 }
 
 uint16_t obsBytes(uint8_t numDrones) {
-    return alignedSize((discreteObsSize(numDrones) * sizeof(uint8_t)) + (continuousObsSize(numDrones) * sizeof(float)), sizeof(float));
+    const uint16_t size = (discreteObsSize(numDrones) * sizeof(uint8_t)) + (continuousObsSize(numDrones) * sizeof(float));
+    const uint8_t align = sizeof(float);
+    return (size + align - 1) & ~(align - 1);
 }
 
 const float MAX_X_POS = 150.0f;
@@ -151,14 +156,14 @@ const float WALL_DENSITY = 4.0f;
 
 // weapon pickup settings
 const float PICKUP_THICKNESS = 3.0f;
-const float PICKUP_SPAWN_DISTANCE_SQUARED = SQUARED(10.0f);
+const float PICKUP_SPAWN_DISTANCE_SQUARED = 10.0f * 10.0f;
 const float PICKUP_RESPAWN_WAIT = 3.0f;
 const float SUDDEN_DEATH_PICKUP_RESPAWN_WAIT = 2.0f;
 
 // drone settings
 const float DRONE_WALL_SPAWN_DISTANCE = 2.0f;
 const float DRONE_DEATH_WALL_SPAWN_DISTANCE = 7.5f;
-const float DRONE_DRONE_SPAWN_DISTANCE_SQUARED = SQUARED(10.0f);
+const float DRONE_DRONE_SPAWN_DISTANCE_SQUARED = 10.0f * 10.0f;
 
 #define DRONE_RADIUS 1.0f
 #define DRONE_DENSITY 1.25f

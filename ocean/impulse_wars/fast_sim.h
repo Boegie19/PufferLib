@@ -4,6 +4,8 @@
 #include <math.h>
 #include <float.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
 typedef struct fsVec2 {
     float x;
@@ -237,6 +239,11 @@ typedef struct fsWorld {
     fsContactEvent events[MAX_EVENTS];
     uint16_t numEvents;
 } fsWorld;
+
+static inline void fsWorld_Init(fsWorld* w, fsVec2 gravity) {
+    memset(w, 0, sizeof(fsWorld));
+    w->gravity = gravity;
+}
 
 static inline fsBody* fsWorld_CreateBody(fsWorld* w) {
     for (uint16_t i = 0; i < MAX_BODIES; i++) {

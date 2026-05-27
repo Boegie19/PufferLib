@@ -3,13 +3,10 @@
 
 #include "fast_sim.h"
 #include "fs_compat.h"
-#include "id_pool.h"
 #include "raylib.h"
 #include "rlights.h"
 
 #include "include/cc_array.h"
-
-#include "settings.h"
 
 #define _MAX_DRONES 4
 
