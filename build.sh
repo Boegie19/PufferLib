@@ -117,6 +117,7 @@ elif [ "$ENV" = "impulse_wars" ]; then
     download "$BOX2D_NAME" "$BOX2D_URL/$BOX2D_NAME.tar.gz"
     INCLUDES+=(-I./$BOX2D_NAME/include -I./$BOX2D_NAME/src)
     LINK_ARCHIVES+=("./$BOX2D_NAME/libbox2d.a")
+    EXTRA_LDFLAGS+=(-L"./$BOX2D_NAME" -lbox2d -Wl,-rpath,"./$BOX2D_NAME" -ldl)
 elif [ "$ENV" = "nethack" ]; then
     SRC_DIR="ocean/$ENV"
     NLE_DIR="vendor/nle"

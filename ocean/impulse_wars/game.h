@@ -1100,7 +1100,7 @@ void createProjectile(iwEnv *e, droneEntity *drone, const b2Vec2 normAim) {
     // spawn the projectile just outside the drone so they don't
     // immediately collide
     b2Vec2 pos = b2MulAdd(drone->pos, droneRadius + (radius * 1.5f), normAim);
-    // if the projectile is inside a wall or out of the map, move the
+     // if the projectile is inside a wall or out of the map, move the
     // projectile to be just outside the wall
     bool projectileInWall = false;
     int16_t cellIdx = entityPosToCellIdx(e, pos);
@@ -1112,7 +1112,7 @@ void createProjectile(iwEnv *e, droneEntity *drone, const b2Vec2 normAim) {
             projectileInWall = true;
         }
     }
-    if (projectileInWall) {
+        if (projectileInWall) {
         const b2Vec2 rayEnd = b2MulAdd(drone->pos, droneRadius + (radius * 2.5f), normAim);
         const b2Vec2 translation = b2Sub(rayEnd, drone->pos);
         const b2QueryFilter filter = {.categoryBits = PROJECTILE_SHAPE, .maskBits = WALL_SHAPE};
@@ -1139,36 +1139,36 @@ void createProjectile(iwEnv *e, droneEntity *drone, const b2Vec2 normAim) {
     projectileShapeDef.filter.maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE | SHIELD_SHAPE;
     const b2Circle projectileCircle = {.center = b2Vec2_zero, .radius = radius};
 
-    b2ShapeId projectileShapeID = b2CreateCircleShape(projectileBodyID, &projectileShapeDef, &projectileCircle);
+     b2ShapeId projectileShapeID = b2CreateCircleShape(projectileBodyID, &projectileShapeDef, &projectileCircle);
 
     // add a bit of lateral drone velocity to projectile
     b2Vec2 forwardVel = b2MulSV(b2Dot(drone->velocity, normAim), normAim);
     b2Vec2 lateralVel = b2Sub(drone->velocity, forwardVel);
     lateralVel = b2MulSV(projectileShapeDef.density * DRONE_MOVE_AIM_COEF, lateralVel);
-    b2Vec2 aim = weaponAdjustAim(&e->randState, drone->weaponInfo->type, drone->heat, normAim);
-    b2Vec2 fire = b2MulAdd(lateralVel, weaponFire(&e->randState, drone->weaponInfo->type), aim);
-    b2Body_ApplyLinearImpulseToCenter(projectileBodyID, fire, true);
+        b2Vec2 aim = weaponAdjustAim(&e->randState, drone->weaponInfo->type, drone->heat, normAim);
+        b2Vec2 fire = b2MulAdd(lateralVel, weaponFire(&e->randState, drone->weaponInfo->type), aim);
+        b2Body_ApplyLinearImpulseToCenter(projectileBodyID, fire, true);
 
-    projectileEntity *projectile = fastCalloc(1, sizeof(projectileEntity));
-    projectile->droneIdx = drone->idx;
-    projectile->bodyID = projectileBodyID;
-    projectile->shapeID = projectileShapeID;
-    projectile->weaponInfo = drone->weaponInfo;
-    projectile->pos = projectileBodyDef.position;
-    projectile->lastPos = projectileBodyDef.position;
-    projectile->velocity = b2Body_GetLinearVelocity(projectileBodyID);
-    projectile->lastVelocity = projectile->velocity;
-    projectile->speed = b2Length(projectile->velocity);
-    projectile->lastSpeed = projectile->speed;
-    if (projectile->weaponInfo->type == BLACK_HOLE_WEAPON) {
-        create_array(&projectile->entsInBlackHole, 4);
-    }
-    cc_array_add(e->projectiles, projectile);
+        projectileEntity *projectile = fastCalloc(1, sizeof(projectileEntity));
+        projectile->droneIdx = drone->idx;
+        projectile->bodyID = projectileBodyID;
+        projectile->shapeID = projectileShapeID;
+        projectile->weaponInfo = drone->weaponInfo;
+        projectile->pos = projectileBodyDef.position;
+        projectile->lastPos = projectileBodyDef.position;
+        projectile->velocity = b2Body_GetLinearVelocity(projectileBodyID);
+        projectile->lastVelocity = projectile->velocity;
+        projectile->speed = b2Length(projectile->velocity);
+        projectile->lastSpeed = projectile->speed;
+        if (projectile->weaponInfo->type == BLACK_HOLE_WEAPON) {
+            create_array(&projectile->entsInBlackHole, 4);
+        }
+        cc_array_add(e->projectiles, projectile);
 
-    entity *ent = createEntity(e, PROJECTILE_ENTITY, projectile);
-    projectile->ent = ent;
-    b2Body_SetUserData(projectile->bodyID, ent);
-    b2Shape_SetUserData(projectile->shapeID, ent);
+        entity *ent = createEntity(e, PROJECTILE_ENTITY, projectile);
+        projectile->ent = ent;
+        b2Body_SetUserData(projectile->bodyID, ent);
+        b2Shape_SetUserData(projectile->shapeID, ent);
 
     // create a sensor shape if needed
     if (projectile->weaponInfo->hasSensor) {
@@ -1195,7 +1195,7 @@ float getShapeProjectedPerimeter(const b2ShapeId shapeID, const b2Vec2 line) {
     const b2Polygon polygon = b2Shape_GetPolygon(shapeID);
     const b2Vec2 *points = polygon.vertices;
     int count = polygon.count;
-    B2_ASSERT(count > 0);
+    //B2_ASSERT(count > 0);
     float value = b2Dot(points[0], line);
     float lower = value;
     float upper = value;

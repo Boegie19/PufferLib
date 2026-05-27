@@ -503,7 +503,11 @@ void setupEnv(iwEnv *e) {
         renderEnv(e, true, false, -1, -1);
     }
 
-    computeObs(e);
+    if (e->observations != NULL) {
+        computeObs(e);
+    } else {
+        DEBUG_LOG("Skipping computeObs: Observation buffer not bound by Python yet.");
+    }
 }
 
 // sets the timing related variables for the environment depending on

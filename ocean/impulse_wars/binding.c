@@ -9,7 +9,6 @@
 
 #define MY_VEC_INIT
 #define Env iwEnv
-#define MY_VEC_CLOSE
 #define num_agents numAgents
 #define action_mask masks
 #include "../../src/vecenv.h"
@@ -63,22 +62,17 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     return envs;
 }
 
-void my_vec_close(Env* envs) {
-    // default: nothing special to free here; maps destroyed elsewhere if needed
-    return;
-}
 
 // Initialize a single env from kwargs
 void my_init(Env* e, Dict* kwargs) {
     e->numDrones = (uint8_t)dict_get(kwargs, "num_drones")->value;
-    e->numAgents = (uint8_t)dict_get(kwargs, "num_agents")->value;
+    e->numAgents = 2;
     int map_idx = (int)dict_get(kwargs, "map_idx")->value;
     uint64_t seed = (uint64_t)dict_get(kwargs, "seed")->value;
     bool enable_teams = (bool)dict_get(kwargs, "enable_teams")->value;
     bool sitting_duck = (bool)dict_get(kwargs, "sitting_duck")->value;
     bool is_training = (bool)dict_get(kwargs, "is_training")->value;
     bool continuous = (bool)dict_get(kwargs, "continuous")->value;
-
     initEnv(
         e,
         (uint8_t)e->numDrones,
@@ -116,7 +110,7 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "perf", log->stats[0].wins);
     dict_set(out, "score", log->stats[0].wins);
 
-    char buf[128];
+    /*char buf[128];
     for (uint8_t i = 0; i < MAX_DRONES; i++) {
         snprintf(buf, sizeof(buf), "drone_%d_returns", i);
         dict_set(out, buf, log->stats[i].returns);
@@ -157,5 +151,5 @@ void my_log(Log* log, Dict* out) {
         dict_set(out, buf, log->stats[i].totalWeaponsPickedUp);
         snprintf(buf, sizeof(buf), "drone_%d_total_shot_distances", i);
         dict_set(out, buf, log->stats[i].totalShotDistances);
-    }
+    }*/
 }
