@@ -951,15 +951,15 @@ void renderExplosions(const iwEnv *e) {
         if (false && explosion->isBurst) {
             const Color droneColor = Fade(getDroneColor(explosion->droneIdx), alpha);
             DrawSphereEx(
-                (Vector3){.x = explosion->def.position.x, .y = 0.5f, .z = explosion->def.position.y},
-                explosion->def.radius + explosion->def.falloff,
+                (Vector3){.x = explosion->pos.x, .y = 0.5f, .z = explosion->pos.y},
+                explosion->radius * 1.5f,
                 20,
                 50,
                 DARKGRAY
             );
             DrawSphereEx(
-                (Vector3){.x = explosion->def.position.x, .y = 0.5f, .z = explosion->def.position.y},
-                explosion->def.radius,
+                (Vector3){.x = explosion->pos.x, .y = 0.5f, .z = explosion->pos.y},
+                explosion->radius,
                 20,
                 50,
                 droneColor
@@ -969,15 +969,15 @@ void renderExplosions(const iwEnv *e) {
             const Color explosionColor = Fade(RAYWHITE, alpha);
 
             DrawSphereEx(
-                (Vector3){.x = explosion->def.position.x, .y = 0.5f, .z = explosion->def.position.y},
-                explosion->def.radius + explosion->def.falloff,
+                (Vector3){.x = explosion->pos.x, .y = 0.5f, .z = explosion->pos.y},
+                explosion->radius * 1.5f,
                 20,
                 50,
                 falloffColor
             );
             DrawSphereEx(
-                (Vector3){.x = explosion->def.position.x, .y = 0.5f, .z = explosion->def.position.y},
-                explosion->def.radius,
+                (Vector3){.x = explosion->pos.x, .y = 0.5f, .z = explosion->pos.y},
+                explosion->radius,
                 20,
                 50,
                 explosionColor
@@ -1027,8 +1027,7 @@ void renderWall(const iwEnv *e, const wallEntity *wall) {
 
     float angle = 0.0f;
     if (wall->isFloating) {
-        angle = fsRot_GetAngle(wall->rot);
-        angle *= RAD2DEG;
+        angle = RAD2DEG * atan2f(wall->rot.s, wall->rot.c);
     }
 
     float y;
@@ -1126,7 +1125,7 @@ void renderDronePieces(iwEnv *e) {
         const float alpha = 1.0f - (baseAlpha * ((float)piece->lifetime / maxLifetime));
         const float finalAlpha = 1.0f - (SQUARED(alpha) * alpha);
         const Color color = Fade(getDroneColor(piece->droneIdx), finalAlpha);
-        const float angle = RAD2DEG * fsRot_GetAngle(piece->rot);
+        const float angle = RAD2DEG * atan2f(piece->rot.s, piece->rot.c);
 
         // Draw edges of the triangle
         rlPushMatrix();
@@ -1180,12 +1179,18 @@ void renderDroneRespawnGuides(const iwEnv *e, droneEntity *drone) {
 }
 
 fsRayCastResult droneAimingAt(const iwEnv *e, const droneEntity *drone) {
-    return fsRayCast(&e->world, drone->pos, drone->lastAim, 150.0f, (entity*)drone->ent);
+    fsRayCastResult rayRes = {0};
+    const fsVec2 rayDir = fsMul(drone->lastAim, 150.0f);
+    const bool hit = fsRayCast((fsWorld *)&e->world, drone->pos, rayDir, 1.0f, WALL_SHAPE | FLOATING_WALL_SHAPE, &rayRes);
+    if (!hit) {
+        rayRes.fraction = 1.0f;
+    }
+    return rayRes;
 }
 
 void renderDroneAimGuide(const iwEnv *e, const droneEntity *drone) {
     fsRayCastResult rayRes = droneAimingAt(e, drone);
-    float distance = rayRes.hit ? rayRes.fraction * 150.0f : 150.0f;
+    float distance = rayRes.fraction * 150.0f;
     
     float aimGuideWidth = getWeaponAimGuideWidth(drone->weaponInfo->type);
     aimGuideWidth = min(aimGuideWidth, distance + 0.1f) + (DRONE_RADIUS * 2.0f);
@@ -1492,8 +1497,8 @@ void minimalStepEnv(iwEnv *e) {
             continue;
         }
         // update shield velocity/pos if its active
-        drone->shield->body->pos = drone->body->pos;
-        drone->shield->body->vel = drone->body->vel;
+        FS_BODY_POS(&e->world, drone->shield->body) = FS_BODY_POS(&e->world, drone->body);
+        FS_BODY_VEL(&e->world, drone->shield->body) = FS_BODY_VEL(&e->world, drone->body);
     }
 
     fsWorld_Step(&e->world, e->deltaTime);

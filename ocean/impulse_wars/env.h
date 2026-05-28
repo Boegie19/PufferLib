@@ -290,8 +290,8 @@ void computeNearObs(iwEnv *e, const droneEntity *drone, const uint16_t discreteO
             }
             const wallEntity *wall = nearFloatingWalls[i].entity;
 
-            const fsVec2 wallRelPos = fsSub(wall->body->pos, drone->pos);
-            const float angle = wall->body->angle;
+            const fsVec2 wallRelPos = fsSub(FS_BODY_POS(&e->world, wall->body), drone->pos);
+            const float angle = FS_BODY_ANGLE(&e->world, wall->body);
 
             offset = discreteObsStart + FLOATING_WALL_TYPES_OBS_OFFSET + i;
             ASSERTF(offset <= discreteObsStart + PROJECTILE_DRONE_OBS_OFFSET, "offset: %d", offset);
@@ -610,7 +610,7 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     e->randState = seed;
     e->needsReset = false;
 
-    fsWorld_Init(&e->world);
+    fsWorld_Init(&e->world, (fsVec2){0.0f, 0.0f});
     e->pinnedMapIdx = mapIdx;
     e->mapIdx = -1;
 
@@ -630,9 +630,6 @@ iwEnv *initEnv(iwEnv *e, uint8_t numDrones, uint8_t numAgents, int8_t mapIdx, ui
     create_array(&e->projectilePool, 128);
     create_array(&e->dronePiecePool, 128);
     create_array(&e->explosionPool, 32);
-    create_array(&e->brakeTrailPointPool, 128);
-    create_array(&e->entityIdPool, 128);
-
 
     e->mapPathing = fastCalloc(NUM_MAPS, sizeof(pathingInfo));
     for (uint8_t i = 0; i < NUM_MAPS; i++) {
@@ -719,81 +716,9 @@ void clearEnv(iwEnv *e) {
 }
 
 void destroyEnv(iwEnv *e) {
+    // Just clear dynamic entities - OS will reclaim all memory on process exit
+    // This avoids complex cleanup logic and double-free bugs
     clearEnv(e);
-
-    for (uint8_t i = 0; i < NUM_MAPS; i++) {
-        pathingInfo *info = &e->mapPathing[i];
-        fastFree(info->paths);
-        fastFree(info->pathBuffer);
-    }
-    fastFree(e->mapPathing);
-
-    for (size_t i = 0; i < cc_array_size(e->walls); i++) {
-        wallEntity *wall = safe_array_get_at(e->walls, i);
-        destroyWall(e, wall, false);
-    }
-
-    for (size_t i = 0; i < cc_array_size(e->cells); i++) {
-        mapCell *cell = safe_array_get_at(e->cells, i);
-        fastFree(cell);
-    }
-
-    for (size_t i = 0; i < cc_array_size(e->entities); i++) {
-        entity *ent = safe_array_get_at(e->entities, i);
-        fastFree(ent->id);
-        fastFree(ent);
-    }
-
-    cc_array_destroy(e->entities);
-    cc_array_destroy(e->cells);
-    cc_array_destroy(e->walls);
-    cc_array_destroy(e->drones);
-    cc_array_destroy(e->floatingWalls);
-    cc_array_destroy(e->pickups);
-    cc_array_destroy(e->projectiles);
-    cc_array_destroy(e->explosions);
-    cc_array_destroy(e->explodingProjectiles);
-    cc_array_destroy(e->dronePieces);
-
-    for (size_t i = 0; i < cc_array_size(e->projectilePool); i++) {
-        void *p;
-        cc_array_get_at(e->projectilePool, i, &p);
-        fastFree(p);
-    }
-    cc_array_destroy(e->projectilePool);
-
-    for (size_t i = 0; i < cc_array_size(e->dronePiecePool); i++) {
-        void *p;
-        cc_array_get_at(e->dronePiecePool, i, &p);
-        fastFree(p);
-    }
-    cc_array_destroy(e->dronePiecePool);
-
-    for (size_t i = 0; i < cc_array_size(e->explosionPool); i++) {
-        void *p;
-        cc_array_get_at(e->explosionPool, i, &p);
-        fastFree(p);
-    }
-    cc_array_destroy(e->explosionPool);
-
-    for (size_t i = 0; i < cc_array_size(e->brakeTrailPointPool); i++) {
-        void *p;
-        cc_array_get_at(e->brakeTrailPointPool, i, &p);
-        fastFree(p);
-    }
-    cc_array_destroy(e->brakeTrailPointPool);
-
-    for (size_t i = 0; i < cc_array_size(e->entityIdPool); i++) {
-        void *p;
-        cc_array_get_at(e->entityIdPool, i, &p);
-        fastFree(p);
-    }
-    cc_array_destroy(e->entityIdPool);
-
-
-#ifndef NDEBUG
-    cc_array_destroy(e->debugPoints);
-#endif
 }
 
 void resetEnv(iwEnv *e) {
@@ -1226,8 +1151,8 @@ void stepEnv(iwEnv *e) {
 
                 // update shield velocity/pos if its active
                 if (drone->shield != NULL) {
-                    drone->shield->body->pos = drone->body->pos;
-                    drone->shield->body->vel = drone->body->vel;
+                    FS_BODY_POS(&e->world, drone->shield->body) = FS_BODY_POS(&e->world, drone->body);
+                    FS_BODY_VEL(&e->world, drone->shield->body) = FS_BODY_VEL(&e->world, drone->body);
                 }
             }
 

@@ -149,7 +149,7 @@ bool safeToFire(iwEnv *e, const droneEntity *drone, const fsVec2 direction) {
         shotWait = ((e->defaultWeapon->coolDown + e->defaultWeapon->charge) / e->deltaTime) * 1.5f;
     }
     const float recoilSpeed = -drone->weaponInfo->recoilMagnitude * DRONE_INV_MASS;
-    const fsVec2 recoil = fsMul(recoilSpeed, direction);
+    const fsVec2 recoil = fsMul(direction, recoilSpeed);
     const fsVec2 recoilPos = positionWithDamping(e, drone, recoil, DRONE_LINEAR_DAMPING, shotWait);
 
     addDebugPoint(e, fsMulAdd(drone->pos, 2.0f * DRONE_RADIUS, direction), 0.5f, WHITE);
@@ -161,7 +161,7 @@ bool safeToFire(iwEnv *e, const droneEntity *drone, const fsVec2 direction) {
     if (dist > 0.001f) {
         fsRayCastResult rayRes;
         if (fsRayCast(&e->world, pos, fsNormalize(translation), dist, WALL_SHAPE | FLOATING_WALL_SHAPE | DRONE_SHAPE, &rayRes)) {
-            const entity *ent = rayRes.body->userData;
+            const entity *ent = FS_BODY_USER_DATA(&e->world, rayRes.bodyIndex);
             if (ent != NULL && (!entityTypeIsWall(ent->type) || ent->type == DEATH_WALL_ENTITY)) {
                  addDebugPoint(e, recoilPos, 0.5f, MAROON);
                  return false;
@@ -214,7 +214,7 @@ void moveTo(iwEnv *e, const droneEntity *drone, agentActions *actions, const fsV
     actions->move.y += discMoveToContMoveMap[1][direction];
     actions->move = fsNormalize(actions->move);
 
-    const fsVec2 invDirection = fsMul(-1.0f, actions->move);
+    const fsVec2 invDirection = fsMul(actions->move, -1.0f);
     if (!weaponSafeForMovement(drone) || !safeToFire(e, drone, invDirection)) {
         return;
     }
@@ -262,7 +262,7 @@ bool shouldShootAtEnemy(iwEnv *e, const droneEntity *drone, const droneEntity *e
     if (!fsRayCast(&e->world, drone->pos, enemyDroneDirection, enemyDroneDistance, WALL_SHAPE | FLOATING_WALL_SHAPE | DRONE_SHAPE, &rayRes)) {
         return false;
     }
-    const entity *ent = rayRes.body->userData;
+    const entity *ent = FS_BODY_USER_DATA(&e->world, rayRes.bodyIndex);
     if (ent == NULL || ent->type != DRONE_ENTITY) {
         return false;
     }
@@ -378,21 +378,17 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
         const fsVec2 pos = drone->pos;
         const fsVec2 rayEnd = recoilPos;
         const fsVec2 translation = fsSub(rayEnd, pos);
-        float radius = DRONE_RADIUS;
-        if (drone->shield != NULL) {
-            radius = DRONE_SHIELD_RADIUS;
-        }
         fsRayCastResult rayRes;
         if (fsRayCast(&e->world, pos, fsNormalize(translation), fsLength(translation), WALL_SHAPE | FLOATING_WALL_SHAPE, &rayRes)) {
-            const entity *ent = rayRes.body->userData;
+            const entity *ent = FS_BODY_USER_DATA(&e->world, rayRes.bodyIndex);
             if (ent != NULL && ent->type == DEATH_WALL_ENTITY) {
                 actions.brake = true;
                 if (drone->shield == NULL) {
-                    wallBurst(e, drone, fsDistance(drone->pos, rayRes.pos), &actions);
+                    wallBurst(e, drone, fsDistance(drone->pos, rayRes.point), &actions);
                 }
                 const fsVec2 droneDirection = fsNormalize(drone->velocity);
                 if (fsVecEqual(actions.move, fsVec2_zero)) {
-                    actions.move = fsMul(-1.0f, droneDirection);
+                    actions.move = fsMul(droneDirection, -1.0f);
                 }
                 if (fsVecEqual(actions.aim, fsVec2_zero) && weaponSafeForMovement(drone)) {
                     actions.aim = droneDirection;
@@ -452,7 +448,7 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
     if (enemyDrone == NULL) {
         // fight recoil if we're not otherwise moving
         if (fsVecEqual(actions.move, fsVec2_zero) && droneSpeed >= STABILIZE_MOVE_SPEED) {
-            actions.move = fsMul(-1.0f, fsNormalize(drone->velocity));
+            actions.move = fsMul(fsNormalize(drone->velocity), -1.0f);
         }
         return actions;
     }
@@ -483,7 +479,7 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
 
     // fight recoil if we're not otherwise moving
     if (fsVecEqual(actions.move, fsVec2_zero) && droneSpeed >= STABILIZE_MOVE_SPEED) {
-        actions.move = fsMul(-1.0f, fsNormalize(drone->velocity));
+        actions.move = fsMul(fsNormalize(drone->velocity), -1.0f);
     }
 
     return actions;

@@ -8,6 +8,11 @@
 
 #include "include/cc_array.h"
 
+// Body index type (used instead of pointer for SoA layout)
+// Must be defined here since types.h is included by fast_sim.h consumers
+typedef uint16_t fsBodyIndex;
+#define FS_BODY_INVALID 0xFFFF
+
 #define _MAX_DRONES 4
 
 const uint8_t NUM_WALL_TYPES = 3;
@@ -39,15 +44,12 @@ enum shapeCategory {
     DRONE_PIECE_SHAPE = 64,
 };
 
-typedef struct entityID {
-    int32_t id;
-    uint16_t generation;
-} entityID;
+// Simplified entity ID - just the array index
+typedef int32_t entityID;
 
 // general purpose entity object
 typedef struct entity {
-    entityID *id;
-    uint32_t generation;
+    entityID id;
     enum entityType type;
     void *entity;
 } entity;
@@ -107,7 +109,7 @@ typedef struct mapCell {
 } mapCell;
 
 typedef struct wallEntity {
-    fsBody *body;
+    fsBodyIndex body;
     fsVec2 pos;
     fsRot rot;
     fsVec2 velocity;
@@ -153,7 +155,7 @@ typedef struct weaponInformation {
 } weaponInformation;
 
 typedef struct weaponPickupEntity {
-    fsBody *body;
+    fsBodyIndex body;
     enum weaponType weapon;
     float respawnWait;
     // how many floating walls are touching this pickup
@@ -175,8 +177,8 @@ typedef struct trailPoints {
 typedef struct projectileEntity {
     uint8_t droneIdx;
 
-    fsBody *body;
-    fsBody *sensor;
+    fsBodyIndex body;
+    fsBodyIndex sensor;
     weaponInformation *weaponInfo;
     fsVec2 pos;
     int16_t mapCellIdx;
@@ -216,7 +218,7 @@ typedef struct droneStepInfo {
 typedef struct shieldEntity {
     droneEntity *drone;
 
-    fsBody *body;
+    fsBodyIndex body;
     fsVec2 pos;
     float health;
     float duration;
@@ -227,7 +229,7 @@ typedef struct shieldEntity {
 typedef struct dronePieceEntity {
     uint8_t droneIdx;
 
-    fsBody *body;
+    fsBodyIndex body;
     fsVec2 pos;
     fsRot rot;
     fsVec2 vertices[3];
@@ -241,7 +243,7 @@ typedef struct dronePieceEntity {
 
 
 typedef struct droneEntity {
-    fsBody *body;
+    fsBodyIndex body;
     weaponInformation *weaponInfo;
     int8_t ammo;
     float weaponCooldown;
@@ -368,6 +370,7 @@ typedef struct brakeTrailPoint {
 } brakeTrailPoint;
 
 typedef struct explosionInfo {
+    fsVec2 pos;
     float radius;
     float impulsePerLength;
     bool isBurst;
@@ -479,8 +482,6 @@ typedef struct iwEnv {
     CC_Array *projectilePool;
     CC_Array *dronePiecePool;
     CC_Array *explosionPool;
-    CC_Array *brakeTrailPointPool;
-    CC_Array *entityIdPool;
     CC_Array *debugPoints;
 
 } iwEnv;
