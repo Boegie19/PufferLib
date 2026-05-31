@@ -24,7 +24,7 @@ int main(void) {
     e->client = client;
 
     initEnv(e, NUM_DRONES, 0, -1, time(NULL), false, false, false, false);
-    initMaps(e);
+    initMaps();
     setupEnv(e);
     // e->humanInput = true;
 

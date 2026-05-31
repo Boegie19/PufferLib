@@ -47,7 +47,8 @@ void pathfindBFS(const iwEnv *e, uint8_t *flatPaths, uint16_t destCellIdx) {
     uint16_t start = 0;
     uint16_t end = 1;
 
-    const mapCell *cell = safe_array_get_at(e->cells, destCellIdx);
+    const mapCell *cell = cell_soa_get(&e->cells, destCellIdx);
+    if (cell == NULL) return;
     if (cell->ent != NULL && entityTypeIsWall(cell->ent->type)) {
         return;
     }
@@ -67,7 +68,11 @@ void pathfindBFS(const iwEnv *e, uint8_t *flatPaths, uint16_t destCellIdx) {
             continue;
         }
         int16_t cellIdx = cellIndex(e, startCol, startRow);
-        const mapCell *cell = safe_array_get_at(e->cells, cellIdx);
+        const mapCell *cell = cell_soa_get(&e->cells, cellIdx);
+        if (cell == NULL) {
+            paths[startRow][startCol] = 8;
+            continue;
+        }
         if (cell->ent != NULL && entityTypeIsWall(cell->ent->type)) {
             paths[startRow][startCol] = 8;
             continue;
@@ -350,8 +355,9 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
         handleWallProximity(e, drone, wall, output.distance, &actions);
     }
 
-    for (uint8_t i = 0; i < cc_array_size(e->floatingWalls); i++) {
-        wallEntity *floatingWall = safe_array_get_at(e->floatingWalls, i);
+    for (uint8_t i = 0; i < wall_soa_size(&e->floatingWalls); i++) {
+        wallEntity *floatingWall = wall_soa_get(&e->floatingWalls, i);
+        if (floatingWall == NULL) continue;
         if (floatingWall->type != DEATH_WALL_ENTITY) {
             continue;
         }
@@ -406,11 +412,12 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
     }
 
     // get a weapon if the standard weapon is active
-    if (drone->weaponInfo->type == STANDARD_WEAPON && cc_array_size(e->pickups) != 0) {
+    if (drone->weaponInfo->type == STANDARD_WEAPON && pickup_soa_size(&e->pickups) != 0) {
         nearEntity nearPickups[MAX_WEAPON_PICKUPS] = {0};
         uint8_t numActivePickups = 0;
-        for (uint8_t i = 0; i < cc_array_size(e->pickups); i++) {
-            weaponPickupEntity *pickup = safe_array_get_at(e->pickups, i);
+        for (uint8_t i = 0; i < pickup_soa_size(&e->pickups); i++) {
+            weaponPickupEntity *pickup = pickup_soa_get(&e->pickups, i);
+            if (pickup == NULL) continue;
             if (pickup->floatingWallsTouching > 0) {
                 continue;
             }
@@ -431,11 +438,12 @@ agentActions scriptedAgentActions(iwEnv *e, droneEntity *drone) {
     // find closest enemy drone
     droneEntity *enemyDrone = NULL;
     float closestDistanceSquared = FLT_MAX;
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
         if (i == drone->idx) {
             continue;
         }
-        droneEntity *otherDrone = safe_array_get_at(e->drones, i);
+        droneEntity *otherDrone = drone_soa_get(&e->drones, i);
+        if (otherDrone == NULL) continue;
         if (otherDrone->dead || otherDrone->team == drone->team) {
             continue;
         }

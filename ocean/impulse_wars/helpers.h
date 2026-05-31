@@ -141,8 +141,7 @@ static inline void create_array(CC_Array **array, size_t initialCap) {
     cc_array_new_conf(&conf, array);
 }
 
-// automatically checks that the index is valid and returns the value
-// so callers can use it as a constant expression
+// Legacy wrapper for compatibility (now uses SoA arrays)
 static inline void *safe_array_get_at(const CC_Array *const array, size_t index) {
     void *val;
     const enum cc_stat res = cc_array_get_at(array, index, &val);

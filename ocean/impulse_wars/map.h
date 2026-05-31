@@ -371,13 +371,14 @@ void resetMap(iwEnv *e) {
         DEBUG_LOG("removing sudden death walls");
         // remove walls from the end of the array, sudden death walls
         // are added last
-        for (int16_t i = cc_array_size(e->walls) - 1; i >= 0; i--) {
-            wallEntity *wall = safe_array_get_at(e->walls, i);
+        for (int16_t i = wall_soa_size(&e->walls) - 1; i >= 0; i--) {
+            wallEntity *wall = wall_soa_get(&e->walls, i);
+            if (wall == NULL) continue;
             if (!wall->isSuddenDeath) {
                 // if we reached the first non sudden death wall, we're done
                 break;
             }
-            cc_array_remove_last(e->walls, NULL);
+            wall_soa_remove(&e->walls, i);
             destroyWall(e, wall, true);
         }
     }
@@ -414,7 +415,7 @@ void resetMap(iwEnv *e) {
                 continue;
             }
 
-            const mapCell *cell = safe_array_get_at(e->cells, cellIdx);
+            const mapCell *cell = cell_soa_get(&e->cells, cellIdx);
             createWall(e, cell->pos, FLOATING_WALL_THICKNESS, FLOATING_WALL_THICKNESS, cellIdx, wallType, true);
             cellIdx++;
         }
@@ -428,20 +429,24 @@ void setupMap(iwEnv *e, const uint8_t mapIdx) {
         return;
     }
 
-    // clear the old map
-    for (size_t i = 0; i < cc_array_size(e->walls); i++) {
-        wallEntity *wall = safe_array_get_at(e->walls, i);
-        destroyWall(e, wall, false);
-    }
+    // Destroy walls and clear buffers when switching maps
+    if (e->mapIdx != -1) {
+        for (size_t i = 0; i < wall_soa_size(&e->walls); i++) {
+            wallEntity *wall = wall_soa_get(&e->walls, i);
+            if (wall == NULL) continue;
+            destroyWall(e, wall, false);
+        }
 
-    for (size_t i = 0; i < cc_array_size(e->cells); i++) {
-        mapCell *cell = safe_array_get_at(e->cells, i);
-        fastFree(cell);
-    }
+        wall_soa_remove_all(&e->walls);
+        cell_soa_remove_all(&e->cells);
+        e->suddenDeathWallsPlaced = false;
 
-    cc_array_remove_all(e->walls);
-    cc_array_remove_all(e->cells);
-    e->suddenDeathWallsPlaced = false;
+        // Clear buffers to prevent dangling pointer access
+        memset(e->cells.entities, 0, sizeof(e->cells.entities));
+        memset(e->walls.entities, 0, sizeof(e->walls.entities));
+        memset(e->projectiles.entities, 0, sizeof(e->projectiles.entities));
+        memset(e->explodingProjectiles.entities, 0, sizeof(e->explodingProjectiles.entities));
+    }
 
     const uint8_t columns = maps[mapIdx]->columns;
     const uint8_t rows = maps[mapIdx]->rows;
@@ -466,7 +471,8 @@ void setupMap(iwEnv *e, const uint8_t mapIdx) {
             mapCell *cell = fastCalloc(1, sizeof(mapCell));
             cell->ent = NULL;
             cell->pos = pos;
-            cc_array_add(e->cells, cell);
+
+            cell_soa_add(&e->cells, cell);
 
             bool floating = false;
             float thickness = WALL_THICKNESS;
@@ -500,15 +506,20 @@ void setupMap(iwEnv *e, const uint8_t mapIdx) {
             if (!floating) {
                 cell->ent = ent;
             }
-            cellIdx++;
         }
     }
+
+    // Pre-calculate map coordinate transforms to avoid divisions in entityPosToCellIdx
+    e->mapOriginX = ((float)e->map->columns * WALL_THICKNESS) / 2.0f;
+    e->mapOriginY = ((float)e->map->rows * WALL_THICKNESS) / 2.0f;
+    e->invWallThickness = 1.0f / WALL_THICKNESS;
 }
 
 void computeMapBoundsAndQuadrants(iwEnv *e, mapEntry *map) {
     mapBounds bounds = {.min = {.x = FLT_MAX, .y = FLT_MAX}, .max = {.x = FLT_MIN, .y = FLT_MIN}};
-    for (size_t i = 0; i < cc_array_size(e->walls); i++) {
-        const wallEntity *wall = safe_array_get_at(e->walls, i);
+    for (size_t i = 0; i < wall_soa_size(&e->walls); i++) {
+        const wallEntity *wall = wall_soa_get(&e->walls, i);
+        if (wall == NULL) continue;
         bounds.min.x = min(wall->pos.x - wall->extent.x + WALL_THICKNESS, bounds.min.x);
         bounds.min.y = min(wall->pos.y - wall->extent.y + WALL_THICKNESS, bounds.min.y);
         bounds.max.x = max(wall->pos.x + wall->extent.x - WALL_THICKNESS, bounds.max.x);
@@ -557,6 +568,9 @@ void computeMapBoundsAndQuadrants(iwEnv *e, mapEntry *map) {
     };
 }
 
+
+
+
 bool posValidDroneSpawnPoint(const iwEnv *e, const fsVec2 pos) {
     const uint32_t maskBits = WALL_SHAPE | FLOATING_WALL_SHAPE;
     droneEntity dummyDrone = {.pos = pos};
@@ -573,70 +587,49 @@ bool posValidDroneSpawnPoint(const iwEnv *e, const fsVec2 pos) {
     return true;
 }
 
-void initMaps(iwEnv *e) {
+void initMaps() {
     for (uint8_t i = 0; i < NUM_MAPS; i++) {
-        setupMap(e, i);
         mapEntry *map = maps[i];
 
-        computeMapBoundsAndQuadrants(e, map);
+        // Compute map bounds purely from layout dimensions (no physics needed)
+        const uint8_t columns = map->columns;
+        const uint8_t rows = map->rows;
+        const float halfWidth = (columns - 1) * WALL_THICKNESS / 2.0f;
+        const float halfHeight = (rows - 1) * WALL_THICKNESS / 2.0f;
 
-        bool *droneSpawns = fastCalloc(map->columns * map->rows, sizeof(bool));
-        uint8_t *packedLayout = fastCalloc(map->columns * map->rows, sizeof(uint8_t));
-        nearEntity *nearestWalls = fastCalloc(MAX_NEAREST_WALLS * map->columns * map->rows, sizeof(nearEntity));
+        map->bounds = (mapBounds){
+            .min = {.x = -halfWidth, .y = -halfHeight},
+            .max = {.x = halfWidth, .y = halfHeight}
+        };
 
-        for (uint16_t i = 0; i < cc_array_size(e->cells); i++) {
-            const mapCell *cell = safe_array_get_at(e->cells, i);
+        // Compute spawn quadrants from bounds
+        map->spawnQuads[0] = (mapBounds){
+            .min = (fsVec2){.x = map->bounds.min.x + WALL_THICKNESS, .y = map->bounds.min.y + WALL_THICKNESS},
+            .max = (fsVec2){.x = 0.0f, .y = 0.0f}
+        };
+        map->spawnQuads[1] = (mapBounds){
+            .min = (fsVec2){.x = 0.0f, .y = map->bounds.min.y + WALL_THICKNESS},
+            .max = (fsVec2){.x = map->bounds.max.x - WALL_THICKNESS, .y = 0.0f}
+        };
+        map->spawnQuads[2] = (mapBounds){
+            .min = (fsVec2){.x = map->bounds.min.x + WALL_THICKNESS, .y = 0.0f},
+            .max = (fsVec2){.x = 0.0f, .y = map->bounds.max.y - WALL_THICKNESS}
+        };
+        map->spawnQuads[3] = (mapBounds){
+            .min = (fsVec2){.x = 0.0f, .y = 0.0f},
+            .max = (fsVec2){.x = map->bounds.max.x - WALL_THICKNESS, .y = map->bounds.max.y - WALL_THICKNESS}
+        };
 
-            // precompute packed map layout
-            if (cell->ent != NULL) {
-                packedLayout[i] = ((cell->ent->type + 1) & TWO_BIT_MASK) << 5;
-                continue;
-            } else {
-                // precompute valid cells for drones to spawn
-                droneSpawns[i] = posValidDroneSpawnPoint(e, cell->pos);
-            }
-
-            // find nearest walls for each empty cell
-            uint16_t wallIdx = 0;
-            nearEntity walls[map->columns * map->rows];
-            memset(walls, 0x0, map->columns * map->rows * sizeof(nearEntity));
-            for (uint16_t j = 0; j < cc_array_size(e->cells); j++) {
-                const mapCell *c = safe_array_get_at(e->cells, j);
-                if (c->ent == NULL) {
-                    continue;
-                }
-
-                walls[wallIdx].idx = wallIdx;
-                walls[wallIdx].distanceSquared = fsDistanceSq(cell->pos, c->pos);
-                wallIdx++;
-            }
-            insertionSort(walls, wallIdx);
-
-            const uint32_t startIdx = i * MAX_NEAREST_WALLS;
-            memcpy(nearestWalls + startIdx, walls, MAX_NEAREST_WALLS * sizeof(nearEntity));
-        }
-        map->droneSpawns = droneSpawns;
-        map->packedLayout = packedLayout;
-        map->nearestWalls = nearestWalls;
-
-        // clear floating walls from the map
-        for (uint8_t i = 0; i < cc_array_size(e->floatingWalls); i++) {
-            wallEntity *wall = safe_array_get_at(e->floatingWalls, i);
-            destroyWall(e, wall, false);
-        }
-        cc_array_remove_all(e->floatingWalls);
+        // Per-environment arrays are now allocated in setupEnv, not here
+        map->droneSpawns = NULL;
+        map->packedLayout = NULL;
+        map->nearestWalls = NULL;
     }
-
-    e->mapIdx = -1;
 }
 
 void destroyMaps() {
-    for (uint8_t i = 0; i < NUM_MAPS; i++) {
-        mapEntry *map = maps[i];
-        fastFree(map->droneSpawns);
-        fastFree(map->packedLayout);
-        fastFree(map->nearestWalls);
-    }
+    // Per-environment arrays are now freed in destroyEnv, not here
+    // Global map data (bounds, quadrants) doesn't need cleanup
 }
 
 void placeRandFloatingWall(iwEnv *e, const enum entityType wallType) {

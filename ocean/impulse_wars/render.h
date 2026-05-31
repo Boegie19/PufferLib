@@ -242,8 +242,9 @@ Rectangle calculatePlayersBoundingBox(const iwEnv *e) {
     float maxX = -FLT_MAX;
     float maxY = -FLT_MAX;
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        const droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        const droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead && drone->livesLeft == 0 && !drone->diedThisStep) {
             continue;
         }
@@ -757,7 +758,8 @@ void renderUI(const iwEnv *e, const bool starting) {
     const uint8_t yMargin = 12 * e->client->scale;
 
     for (int i = 0; i < e->numDrones; i++) {
-        const droneEntity *drone = safe_array_get_at(e->drones, i);
+        const droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
 
         const char *droneNum = TextFormat("Drone %d", drone->idx + 1);
         const Vector2 textSize = MeasureTextEx(GetFontDefault(), droneNum, fontSize, fontSize / 10);
@@ -866,16 +868,13 @@ void renderBrakeTrails(iwEnv *e, const droneEntity *drone) {
     const float trailWidth = 0.33f;
 
     // update lifetimes and prune expired points
-    CC_ArrayIter iter;
-    cc_array_iter_init(&iter, drone->brakeTrailPoints);
-    brakeTrailPoint *pt;
-    while (cc_array_iter_next(&iter, (void **)&pt) != CC_ITER_END) {
+    for (int16_t i = cc_array_size(drone->brakeTrailPoints) - 1; i >= 0; i--) {
+        brakeTrailPoint *pt = safe_array_get_at(drone->brakeTrailPoints, i);
         if (pt->lifetime == UINT16_MAX) {
             pt->lifetime = maxLifetime;
         } else if (pt->lifetime == 0) {
             fastFree(pt);
-            cc_array_iter_remove(&iter, NULL);
-            continue;
+            cc_array_remove_fast_at(drone->brakeTrailPoints, i, NULL);
         } else {
             pt->lifetime--;
         }
@@ -931,16 +930,18 @@ void renderBrakeTrails(iwEnv *e, const droneEntity *drone) {
 void renderExplosions(const iwEnv *e) {
     const uint16_t maxRenderSteps = EXPLOSION_TIME * e->frameRate;
 
-    CC_ArrayIter iter;
-    cc_array_iter_init(&iter, e->explosions);
-    explosionInfo *explosion;
-
-    while (cc_array_iter_next(&iter, (void **)&explosion) != CC_ITER_END) {
+    for (uint8_t i = 0; i < explosion_soa_size(&e->explosions); i++) {
+        explosionInfo *explosion = explosion_soa_get(&e->explosions, i);
+        if (explosion == NULL) continue;
         if (explosion->renderSteps == UINT16_MAX) {
             explosion->renderSteps = maxRenderSteps;
         } else if (explosion->renderSteps == 0) {
-            cc_array_add(e->explosionPool, explosion);
-            cc_array_iter_remove(&iter, NULL);
+            if (e->explosionPool != NULL) {
+                cc_array_add(e->explosionPool, explosion);
+            } else {
+                fastFree(explosion);
+            }
+            explosion_soa_remove(&e->explosions, i);
             continue;
         }
 
@@ -1109,13 +1110,14 @@ void renderWeaponPickup(const iwEnv *e, const weaponPickupEntity *pickup) {
 void renderDronePieces(iwEnv *e) {
     const float maxLifetime = e->frameRate * DRONE_PIECE_LIFETIME;
 
-    CC_ArrayIter iter;
-    cc_array_iter_init(&iter, e->dronePieces);
-    dronePieceEntity *piece;
-
-    while (cc_array_iter_next(&iter, (void **)&piece) != CC_ITER_END) {
+    for (uint8_t i = 0; i < drone_piece_soa_size(&e->dronePieces); i++) {
+        dronePieceEntity *piece = drone_piece_soa_get(&e->dronePieces, i);
+        if (piece == NULL) continue;
         if (piece->lifetime == UINT16_MAX) {
             piece->lifetime = maxLifetime;
+        } else if (piece->lifetime == 0) {
+            destroyDronePiece(e, piece);
+            continue;
         }
 
         float baseAlpha = 1.0f;
@@ -1151,7 +1153,6 @@ void renderDronePieces(iwEnv *e) {
         piece->lifetime--;
         if (piece->lifetime == 0) {
             destroyDronePiece(e, piece);
-            cc_array_iter_remove_fast(&iter, NULL);
         }
     }
 }
@@ -1491,8 +1492,9 @@ void applyBloom(const iwEnv *e, RenderTexture2D srcTex, RenderTexture2D dstTex, 
 }
 
 void minimalStepEnv(iwEnv *e) {
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead || drone->shield == NULL) {
             continue;
         }
@@ -1509,8 +1511,9 @@ void minimalStepEnv(iwEnv *e) {
 
     projectilesStep(e);
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }
@@ -1527,8 +1530,9 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
 
     updateCamera(e);
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        const droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        const droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             // TODO: is there a better way to do this?
             float gridPos[2] = {-1000, -1000};
@@ -1548,8 +1552,9 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
     ClearBackground(BLACK);
     BeginMode3D(e->client->camera->camera3D);
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        const droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        const droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }
@@ -1573,14 +1578,16 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
     BeginMode3D(e->client->camera->camera3D);
 
     BeginBlendMode(BLEND_ALPHA);
-    for (size_t i = 0; i < cc_array_size(e->projectiles); i++) {
-        const projectileEntity *projectile = safe_array_get_at(e->projectiles, i);
+    for (size_t i = 0; i < projectile_soa_size(&e->projectiles); i++) {
+        const projectileEntity *projectile = projectile_soa_get(&e->projectiles, i);
+        if (projectile == NULL) continue;
         renderProjectileTrail(projectile);
     }
     EndBlendMode();
 
-    for (size_t i = 0; i < cc_array_size(e->projectiles); i++) {
-        const projectileEntity *projectile = safe_array_get_at(e->projectiles, i);
+    for (size_t i = 0; i < projectile_soa_size(&e->projectiles); i++) {
+        const projectileEntity *projectile = projectile_soa_get(&e->projectiles, i);
+        if (projectile == NULL) continue;
         renderProjectile(projectile);
     }
 
@@ -1653,14 +1660,16 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
     EndShaderMode();
     EndBlendMode();
 
-    for (size_t i = 0; i < cc_array_size(e->pickups); i++) {
-        const weaponPickupEntity *pickup = safe_array_get_at(e->pickups, i);
+    for (size_t i = 0; i < pickup_soa_size(&e->pickups); i++) {
+        const weaponPickupEntity *pickup = pickup_soa_get(&e->pickups, i);
+        if (pickup == NULL) continue;
         renderWeaponPickup(e, pickup);
     }
 
     BeginBlendMode(BLEND_ALPHA);
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        const droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        const droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         renderBrakeTrails(e, drone);
     }
     EndBlendMode();
@@ -1674,36 +1683,41 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
 
     BeginMode3D(e->client->camera->camera3D);
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }
         renderDroneTrail(drone);
     }
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }
         renderDroneGuides(e, drone, ending);
     }
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        const droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        const droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }
         renderDrone(drone);
     }
 
-    for (size_t i = 0; i < cc_array_size(e->walls); i++) {
-        const wallEntity *wall = safe_array_get_at(e->walls, i);
+    for (size_t i = 0; i < wall_soa_size(&e->walls); i++) {
+        const wallEntity *wall = wall_soa_get(&e->walls, i);
+        if (wall == NULL) continue;
         renderWall(e, wall);
     }
 
-    for (size_t i = 0; i < cc_array_size(e->floatingWalls); i++) {
-        const wallEntity *wall = safe_array_get_at(e->floatingWalls, i);
+    for (size_t i = 0; i < wall_soa_size(&e->floatingWalls); i++) {
+        const wallEntity *wall = wall_soa_get(&e->floatingWalls, i);
+        if (wall == NULL) continue;
         renderWall(e, wall);
     }
 
@@ -1717,8 +1731,9 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
 
     BeginMode2D(e->client->camera->camera2D);
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }
@@ -1736,8 +1751,9 @@ void _renderEnv(iwEnv *e, const bool starting, const bool ending, const int8_t w
 
     EndMode2D();
 
-    for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+    for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (drone->dead) {
             continue;
         }

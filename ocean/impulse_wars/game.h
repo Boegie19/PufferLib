@@ -83,14 +83,12 @@ static inline int16_t cellIndex(const iwEnv *e, const int8_t col, const int8_t r
 // discretizes an entity's position into a cell index; -1 is returned if
 // the position is out of bounds of the map
 static inline int16_t entityPosToCellIdx(const iwEnv *e, const fsVec2 pos) {
-    const float cellX = pos.x + (((float)e->map->columns * WALL_THICKNESS) / 2.0f);
-    const float cellY = pos.y + (((float)e->map->rows * WALL_THICKNESS) / 2.0f);
-    const int8_t cellCol = cellX / WALL_THICKNESS;
-    const int8_t cellRow = cellY / WALL_THICKNESS;
+    const int8_t cellCol = (int8_t)((pos.x + e->mapOriginX) * e->invWallThickness);
+    const int8_t cellRow = (int8_t)((pos.y + e->mapOriginY) * e->invWallThickness);
     const int16_t cellIdx = cellIndex(e, cellCol, cellRow);
+    
     // set the cell to -1 if it's out of bounds
-    if (cellIdx < 0 || (uint16_t)cellIdx >= cc_array_size(e->cells)) {
-        DEBUG_LOGF("invalid cell index: %d from position: (%f, %f)", cellIdx, pos.x, pos.y);
+    if (__builtin_expect(cellIdx < 0 || (uint16_t)cellIdx >= cell_soa_size(&e->cells), 0)) {
         return -1;
     }
     return cellIdx;
@@ -163,7 +161,7 @@ bool posBehindWall(const iwEnv *e, const fsVec2 srcPos, const fsVec2 dstPos, con
         if (FS_BODY_USER_DATA(&e->world, res.bodyIndex) == dstEnt) return false;
         if (targetType != NULL) {
             entity *hitEnt = FS_BODY_USER_DATA(&e->world, res.bodyIndex);
-            if (hitEnt->type == *targetType) return false;
+            if (hitEnt != NULL && hitEnt->type == *targetType) return false;
         }
         return true;
     }
@@ -171,19 +169,35 @@ bool posBehindWall(const iwEnv *e, const fsVec2 srcPos, const fsVec2 dstPos, con
 }
 
 bool isOverlappingCircleInLineOfSight(const iwEnv *e, const entity *ent, const fsVec2 startPos, const float radius, const uint32_t categoryBits, const uint32_t maskBits, const enum entityType *targetType) {
-    for (uint16_t i = 0; i < MAX_BODIES; i++) {
-        if (!FS_BODY_IS_ACTIVE(&e->world, i)) continue;
-        if (!(FS_BODY_CATEGORY_BITS(&e->world, i) & maskBits)) continue;
-        if (targetType != NULL && ((entity*)FS_BODY_USER_DATA(&e->world, i))->type != *targetType) continue;
+    const float radiusPlusPad = radius + 2.0f; // Small padding for safety
+    int32_t gMinX = (int32_t)floorf((startPos.x - radiusPlusPad) * GRID_INV_SIZE);
+    int32_t gMinY = (int32_t)floorf((startPos.y - radiusPlusPad) * GRID_INV_SIZE);
+    int32_t gMaxX = (int32_t)floorf((startPos.x + radiusPlusPad) * GRID_INV_SIZE);
+    int32_t gMaxY = (int32_t)floorf((startPos.y + radiusPlusPad) * GRID_INV_SIZE);
 
-        fsVec2 delta = fsSub(FS_BODY_POS(&e->world, i), startPos);
-        float distSq = fsLengthSq(delta);
-        float bodyRadius = (FS_BODY_SHAPE(&e->world, i).type == FS_CIRCLE ? FS_BODY_SHAPE(&e->world, i).circle.radius : 0.0f);
-        float combinedRadius = radius + bodyRadius;
-        if (distSq < combinedRadius * combinedRadius) {
-            // Check line of sight
-            if (!posBehindWall(e, startPos, FS_BODY_POS(&e->world, i), ent, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, targetType)) {
-                return true;
+    for (int32_t x = gMinX; x <= gMaxX; x++) {
+        for (int32_t y = gMinY; y <= gMaxY; y++) {
+            uint32_t hash = fsGridHash(x, y);
+            const GridCell* cell = &e->world.grid[hash];
+            for (uint16_t k = 0; k < cell->count; k++) {
+                uint16_t i = cell->bodyIndices[k];
+                if (!FS_BODY_IS_ACTIVE(&e->world, i)) continue;
+                if (!(FS_BODY_CATEGORY_BITS(&e->world, i) & maskBits)) continue;
+                
+                entity *bodyEnt = (entity*)FS_BODY_USER_DATA(&e->world, i);
+                if (bodyEnt == NULL) continue;
+                if (targetType != NULL && bodyEnt->type != *targetType) continue;
+
+                fsVec2 delta = fsSub(FS_BODY_POS(&e->world, i), startPos);
+                float distSq = fsLengthSq(delta);
+                float bodyRadius = (FS_BODY_SHAPE(&e->world, i).type == FS_CIRCLE ? FS_BODY_SHAPE(&e->world, i).circle.radius : 0.0f);
+                float combinedRadius = radius + bodyRadius;
+                if (distSq < combinedRadius * combinedRadius) {
+                    // Check line of sight
+                    if (!posBehindWall(e, startPos, FS_BODY_POS(&e->world, i), ent, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, targetType)) {
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -208,142 +222,138 @@ uint8_t cellOffsets[8][2] = {
 // will be returned
 bool findOpenPos(iwEnv *e, const enum shapeCategory shapeType, fsVec2 *emptyPos, int8_t quad) {
     uint8_t checkedCells[BITNSLOTS(MAX_CELLS)] = {0};
-    const size_t nCells = cc_array_size(e->cells) - 1;
+    const uint16_t size = cell_soa_size(&e->cells);
+    if (size == 0) {
+        printf("no cells in map!\n");
+        return false;
+    } 
+    const size_t nCells = size - 1;
     uint16_t attempts = 0;
     bool laxDroneDistanceChecks = false;
     float minSpawnDistance = MIN_SPAWN_DISTANCE;
 
-    while (true) {
-        if (attempts == nCells) {
-            // if we're trying to find a position for a drone and sudden
-            // death walls have been placed, try again this time ignoring
-            // distance checks; the drone must be spawned next
-            // to a death wall in this case
-            if (shapeType == DRONE_SHAPE && e->suddenDeathWallsPlaced && !laxDroneDistanceChecks) {
-                attempts = 0;
-                memset(checkedCells, 0x0, BITNSLOTS(MAX_CELLS));
-                laxDroneDistanceChecks = true;
-                minSpawnDistance = MIN_SD_SPAWN_DISTANCE;
+    for (int pass = 0; pass < 3; pass++) {
+        for (attempts = 0; attempts < size; attempts++) {
+            uint16_t cellIdx;
+            if (quad == -1) {
+                cellIdx = randInt(&e->randState, 0, nCells);
+            } else {
+                const float minX = e->map->spawnQuads[quad].min.x;
+                const float minY = e->map->spawnQuads[quad].min.y;
+                const float maxX = e->map->spawnQuads[quad].max.x;
+                const float maxY = e->map->spawnQuads[quad].max.y;
+
+                fsVec2 randPos = {.x = randFloat(&e->randState, minX, maxX), .y = randFloat(&e->randState, minY, maxY)};
+                cellIdx = entityPosToCellIdx(e, randPos);
+            }
+            if (bitTest(checkedCells, cellIdx)) {
                 continue;
             }
-            return false;
-        }
+            bitSet(checkedCells, cellIdx);
 
-        uint16_t cellIdx;
-        if (quad == -1) {
-            cellIdx = randInt(&e->randState, 0, nCells);
-        } else {
-            const float minX = e->map->spawnQuads[quad].min.x;
-            const float minY = e->map->spawnQuads[quad].min.y;
-            const float maxX = e->map->spawnQuads[quad].max.x;
-            const float maxY = e->map->spawnQuads[quad].max.y;
-
-            fsVec2 randPos = {.x = randFloat(&e->randState, minX, maxX), .y = randFloat(&e->randState, minY, maxY)};
-            cellIdx = entityPosToCellIdx(e, randPos);
-        }
-        if (bitTest(checkedCells, cellIdx)) {
-            continue;
-        }
-        bitSet(checkedCells, cellIdx);
-        attempts++;
-
-        const mapCell *cell = safe_array_get_at(e->cells, cellIdx);
-        if (cell->ent != NULL) {
-            continue;
-        }
-
-        bool tooClose = false;
-        switch (shapeType) {
-        case WEAPON_PICKUP_SHAPE:
-            // ensure pickups don't spawn too close to other pickups
-            for (uint8_t i = 0; i < cc_array_size(e->pickups); i++) {
-                const weaponPickupEntity *pickup = safe_array_get_at(e->pickups, i);
-                if (fsDistanceSq(cell->pos, pickup->pos) < PICKUP_SPAWN_DISTANCE_SQUARED) {
-                    tooClose = true;
-                    break;
-                }
+            const mapCell *cell = cell_soa_get(&e->cells, cellIdx);
+            if (cell == NULL || cell->ent != NULL) {
+                continue;
             }
+
+            bool tooClose = false;
+            switch (shapeType) {
+            case WEAPON_PICKUP_SHAPE:
+                for (uint8_t i = 0; i < pickup_soa_size(&e->pickups); i++) {
+                    const weaponPickupEntity *pickup = pickup_soa_get(&e->pickups, i);
+                    if (pickup == NULL) continue;
+                    if (fsDistanceSq(cell->pos, pickup->pos) < PICKUP_SPAWN_DISTANCE_SQUARED) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                break;
+            case DRONE_SHAPE:
+                if (e->suddenDeathWallsPlaced) {
+                    if (!laxDroneDistanceChecks) {
+                        const uint8_t cellCol = cellIdx / e->map->columns;
+                        const uint8_t cellRow = cellIdx % e->map->columns;
+                        bool deathWallNeighboring = false;
+                        for (uint8_t i = 0; i < 8; i++) {
+                            const int8_t col = cellCol + cellOffsets[i][0];
+                            const int8_t row = cellRow + cellOffsets[i][1];
+                            if (row < 0 || row >= e->map->rows || col < 0 || col >= e->map->columns) {
+                                continue;
+                            }
+                            const int16_t testCellIdx = cellIndex(e, col, row);
+                            const mapCell *testCell = cell_soa_get(&e->cells, testCellIdx);
+                            if (testCell == NULL || (testCell->ent != NULL && testCell->ent->type == DEATH_WALL_ENTITY)) {
+                                deathWallNeighboring = true;
+                                break;
+                            }
+                        }
+                        if (deathWallNeighboring) {
+                            tooClose = true;
+                        }
+                    }
+
+                    if (!tooClose) {
+                        for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+                            const droneEntity *drone = drone_soa_get(&e->drones, i);
+                            if (drone == NULL || drone->dead) continue;
+                            if (fsDistanceSq(cell->pos, drone->pos) == 0.0f) {
+                                tooClose = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    if (!laxDroneDistanceChecks && !e->droneSpawns[cellIdx]) {
+                        tooClose = true;
+                    } else {
+                        for (uint8_t i = 0; i < drone_soa_size(&e->drones); i++) {
+                            const droneEntity *drone = drone_soa_get(&e->drones, i);
+                            if (drone == NULL || drone->dead) continue;
+                            const float minDist = laxDroneDistanceChecks ? 0.0f : DRONE_DRONE_SPAWN_DISTANCE_SQUARED;
+                            if (fsDistanceSq(cell->pos, drone->pos) < minDist) {
+                                tooClose = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+
             if (tooClose) {
                 continue;
             }
-            break;
-        case DRONE_SHAPE:
-            if (e->suddenDeathWallsPlaced) {
-                if (!laxDroneDistanceChecks) {
-                    // if sudden death walls have been placed, ignore the
-                    // spawn points as they may be covered by death walls;
-                    // instead just try and find a cell that doesn't neighbor
-                    // a death wall
-                    const uint8_t cellCol = cellIdx / e->map->columns;
-                    const uint8_t cellRow = cellIdx % e->map->columns;
-                    bool deathWallNeighboring = false;
-                    for (uint8_t i = 0; i < 8; i++) {
-                        const int8_t col = cellCol + cellOffsets[i][0];
-                        const int8_t row = cellRow + cellOffsets[i][1];
-                        if (row < 0 || row >= e->map->rows || col < 0 || col >= e->map->columns) {
-                            continue;
-                        }
-                        const int16_t testCellIdx = cellIndex(e, col, row);
-                        const mapCell *testCell = safe_array_get_at(e->cells, testCellIdx);
-                        if (testCell->ent != NULL && testCell->ent->type == DEATH_WALL_ENTITY) {
-                            deathWallNeighboring = true;
-                            break;
-                        }
-                    }
-                    if (deathWallNeighboring) {
-                        continue;
-                    }
-                }
 
-                // ensure drones aren't spawning on top of each other
-                for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-                    const droneEntity *drone = safe_array_get_at(e->drones, i);
-                    if (drone->dead) {
-                        continue;
-                    }
-                    if (fsDistanceSq(cell->pos, drone->pos) == 0.0f) {
-                        tooClose = true;
-                        break;
-                    }
-                }
-                if (tooClose) {
-                    continue;
-                }
-            } else {
-                if (!e->map->droneSpawns[cellIdx]) {
-                    continue;
-                }
-
-                // ensure drones don't spawn too close to other drones
-                for (uint8_t i = 0; i < cc_array_size(e->drones); i++) {
-                    const droneEntity *drone = safe_array_get_at(e->drones, i);
-                    if (drone->dead) {
-                        continue;
-                    }
-                    if (fsDistanceSq(cell->pos, drone->pos) < DRONE_DRONE_SPAWN_DISTANCE_SQUARED) {
-                        tooClose = true;
-                        break;
-                    }
-                }
-                if (tooClose) {
-                    continue;
-                }
+            uint32_t maskBits = FLOATING_WALL_SHAPE | WEAPON_PICKUP_SHAPE | DRONE_SHAPE;
+            if (shapeType != FLOATING_WALL_SHAPE && !laxDroneDistanceChecks) {
+                maskBits &= ~shapeType;
             }
-            break;
-        default:
-            break;
+
+            if (!isOverlappingAABB(e, cell->pos, minSpawnDistance, shapeType, maskBits)) {
+                *emptyPos = cell->pos;
+                return true;
+            }
         }
 
-        uint32_t maskBits = FLOATING_WALL_SHAPE | WEAPON_PICKUP_SHAPE | DRONE_SHAPE;
-        if (shapeType != FLOATING_WALL_SHAPE && !laxDroneDistanceChecks) {
-            maskBits &= ~shapeType;
-        }
-
-        if (!isOverlappingAABB(e, cell->pos, minSpawnDistance, shapeType, maskBits)) {
-            *emptyPos = cell->pos;
-            return true;
+        // if we failed to find a spot for a drone during sudden death,
+        // try one more pass ignoring distance checks
+        if (shapeType == DRONE_SHAPE && e->suddenDeathWallsPlaced && !laxDroneDistanceChecks) {
+            memset(checkedCells, 0x0, BITNSLOTS(MAX_CELLS));
+            laxDroneDistanceChecks = true;
+            minSpawnDistance = MIN_SD_SPAWN_DISTANCE;
+        } else if (shapeType == DRONE_SHAPE && pass == 1 && !laxDroneDistanceChecks) {
+            // Third pass for normal gameplay: ignore droneSpawns and reduce distance checks
+            memset(checkedCells, 0x0, BITNSLOTS(MAX_CELLS));
+            laxDroneDistanceChecks = true;
+            minSpawnDistance = MIN_SD_SPAWN_DISTANCE;
+        } else {
+            break;
         }
     }
+    printf("failed to find open position for shape type %d after checking %d cells\n", shapeType, attempts);
+    return false;
 }
 
 entity *createWall(iwEnv *e, const fsVec2 pos, const float width, const float height, int16_t cellIdx, const enum entityType type, const bool floating) {
@@ -368,7 +378,15 @@ entity *createWall(iwEnv *e, const fsVec2 pos, const float width, const float he
     FS_BODY_SHAPE(&e->world, idx).type = FS_BOX;
     FS_BODY_SHAPE(&e->world, idx).box.halfExtents = extent;
 
-    wallEntity *wall = fastCalloc(1, sizeof(wallEntity));
+    wallEntity *wall;
+    // Use pool for floating walls (frequently created/destroyed)
+    if (floating && e->wallPool != NULL && cc_array_size(e->wallPool) > 0) {
+        cc_array_remove_last(e->wallPool, (void **)&wall);
+        memset(wall, 0, sizeof(wallEntity));
+    } else {
+        wall = fastCalloc(1, sizeof(wallEntity));
+    }
+    
     wall->body = idx;
     wall->pos = pos;
     wall->rot = fsRot_identity;
@@ -384,20 +402,25 @@ entity *createWall(iwEnv *e, const fsVec2 pos, const float width, const float he
     FS_BODY_USER_DATA(&e->world, idx) = ent;
 
     if (floating) {
-        cc_array_add(e->floatingWalls, wall);
+        uint16_t soaIdx = wall_soa_add(&e->floatingWalls, wall);
+        ent->soaIndex = soaIdx;
         memset(wall->contributions, 0, _MAX_DRONES * sizeof(fsVec2));
     } else {
-        cc_array_add(e->walls, wall);
+        uint16_t soaIdx = wall_soa_add(&e->walls, wall);
+        ent->soaIndex = soaIdx;
     }
 
     return ent;
 }
 
 void destroyWall(iwEnv *e, wallEntity *wall, const bool full) {
+    // Clear physics body user data to prevent dangling pointer access
+    FS_BODY_USER_DATA(&e->world, wall->body) = NULL;
     destroyEntity(e, wall->ent);
 
-    if (full) {
-        mapCell *cell = safe_array_get_at(e->cells, wall->mapCellIdx);
+    // Always clear the cell entity pointer to prevent dangling pointers
+    mapCell *cell = cell_soa_get(&e->cells, wall->mapCellIdx);
+    if (cell != NULL) {
         cell->ent = NULL;
     }
 
@@ -405,10 +428,20 @@ void destroyWall(iwEnv *e, wallEntity *wall, const bool full) {
         for (int i = 0; i < _MAX_DRONES; i++) {
             wall->contributions[i] = fsVec2_zero;
         }
+        // Remove from SoA array using soaIndex
+        wall_soa_remove(&e->floatingWalls, wall->ent->soaIndex);
+        // Return to pool or free
+        if (e->wallPool != NULL) {
+            cc_array_add(e->wallPool, wall);
+        } else {
+            fastFree(wall);
+        }
+    } else {
+        wall_soa_remove(&e->walls, wall->ent->soaIndex);
+        fastFree(wall);
     }
 
     fsWorld_DestroyBody(&e->world, wall->body);
-    fastFree(wall);
 }
 
 enum weaponType randWeaponPickupType(iwEnv *e) {
@@ -469,7 +502,15 @@ void createWeaponPickup(iwEnv *e) {
         ERROR("no open position for weapon pickup");
     }
 
-    weaponPickupEntity *pickup = fastCalloc(1, sizeof(weaponPickupEntity));
+    weaponPickupEntity *pickup;
+    // Use pool for pickups (frequently created/destroyed)
+    if (e->pickupPool != NULL && cc_array_size(e->pickupPool) > 0) {
+        cc_array_remove_last(e->pickupPool, (void **)&pickup);
+        memset(pickup, 0, sizeof(weaponPickupEntity));
+    } else {
+        pickup = fastCalloc(1, sizeof(weaponPickupEntity));
+    }
+    
     pickup->weapon = randWeaponPickupType(e);
     pickup->respawnWait = 0.0f;
     pickup->floatingWallsTouching = 0;
@@ -483,25 +524,34 @@ void createWeaponPickup(iwEnv *e) {
         ERRORF("invalid position for weapon pickup spawn: (%f, %f)", pos.x, pos.y);
     }
     pickup->mapCellIdx = cellIdx;
-    mapCell *cell = safe_array_get_at(e->cells, cellIdx);
+    mapCell *cell = cell_soa_get(&e->cells, cellIdx);
     cell->ent = ent;
 
-    createWeaponPickupBodyShape(e, pickup);
+    uint8_t soaIdx = pickup_soa_add(&e->pickups, pickup);
+    ent->soaIndex = soaIdx;
 
-    cc_array_add(e->pickups, pickup);
+    createWeaponPickupBodyShape(e, pickup);
 }
 
 void destroyWeaponPickup(iwEnv *e, weaponPickupEntity *pickup) {
     destroyEntity(e, pickup->ent);
 
-    mapCell *cell = safe_array_get_at(e->cells, pickup->mapCellIdx);
+    mapCell *cell = cell_soa_get(&e->cells, pickup->mapCellIdx);
     cell->ent = NULL;
 
     if (!pickup->bodyDestroyed) {
         fsWorld_DestroyBody(&e->world, pickup->body);
     }
 
-    fastFree(pickup);
+    // Remove from SoA array using soaIndex
+    pickup_soa_remove(&e->pickups, pickup->ent->soaIndex);
+    
+    // Return to pool or free
+    if (e->pickupPool != NULL) {
+        cc_array_add(e->pickupPool, pickup);
+    } else {
+        fastFree(pickup);
+    }
 }
 
 // destroys the pickup body and shape while the pickup is waiting to
@@ -519,7 +569,7 @@ void disableWeaponPickup(iwEnv *e, weaponPickupEntity *pickup) {
     fsWorld_DestroyBody(&e->world, pickup->body);
     pickup->bodyDestroyed = true;
 
-    mapCell *cell = safe_array_get_at(e->cells, pickup->mapCellIdx);
+    mapCell *cell = cell_soa_get(&e->cells, pickup->mapCellIdx);
     ASSERT(cell->ent != NULL);
     cell->ent = NULL;
 
@@ -613,7 +663,8 @@ void createDrone(iwEnv *e, const uint8_t idx) {
     drone->ent = ent;
     FS_BODY_USER_DATA(&e->world, bodyIdx) = ent;
 
-    cc_array_add(e->drones, drone);
+    uint8_t soaIdx = drone_soa_add(&e->drones, drone);
+    ent->soaIndex = soaIdx;
 
     createDroneShield(e, drone, -(idx + 1));
 }
@@ -634,7 +685,7 @@ void createDronePiece(iwEnv *e, droneEntity *drone, const bool fromShield) {
     const float angle = randFloat(&e->randState, -PI, PI);
 
     dronePieceEntity *piece;
-    if (cc_array_size(e->dronePiecePool) > 0) {
+    if (e->dronePiecePool != NULL && cc_array_size(e->dronePiecePool) > 0) {
         cc_array_remove_last(e->dronePiecePool, (void **)&piece);
         memset(piece, 0, sizeof(dronePieceEntity));
     } else {
@@ -670,14 +721,20 @@ void createDronePiece(iwEnv *e, droneEntity *drone, const bool fromShield) {
     piece->ent = ent;
     FS_BODY_USER_DATA(&e->world, idx) = ent;
 
-    cc_array_add(e->dronePieces, piece);
+    const uint8_t soaIdx = drone_piece_soa_add(&e->dronePieces, piece);
+    ent->soaIndex = soaIdx;
 }
 
 
 void destroyDronePiece(iwEnv *e, dronePieceEntity *piece) {
     fsWorld_DestroyBody(&e->world, piece->body);
     destroyEntity(e, piece->ent);
-    cc_array_add(e->dronePiecePool, piece);
+    drone_piece_soa_remove(&e->dronePieces, piece->ent->soaIndex);
+    if (e->dronePiecePool != NULL) {
+        cc_array_add(e->dronePiecePool, piece);
+    } else {
+        fastFree(piece);
+    }
 }
 
 void destroyDroneShield(iwEnv *e, shieldEntity *shield, const bool createPieces) {
@@ -687,6 +744,7 @@ void destroyDroneShield(iwEnv *e, shieldEntity *shield, const bool createPieces)
         droneAddEnergy(drone, DRONE_SHIELD_BREAK_ENERGY_COST);
     }
     drone->shield = NULL;
+    shield->drone = NULL;
     e->stats[drone->idx].ownShieldBroken++;
 
     fsWorld_DestroyBody(&e->world, shield->body);
@@ -721,6 +779,7 @@ void destroyDrone(iwEnv *e, droneEntity *drone) {
     }
 
     fsWorld_DestroyBody(&e->world, drone->body);
+    drone_soa_remove(&e->drones, drone->ent->soaIndex);
     fastFree(drone);
 }
 
@@ -810,8 +869,10 @@ void findDroneKiller(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
         e->stats[killer].kills++;
     }
     drone->killedBy = killer;
-    droneEntity *killerDrone = safe_array_get_at(e->drones, killer);
-    killerDrone->killed[drone->idx] = true;
+    droneEntity *killerDrone = drone_soa_get(&e->drones, killer);
+    if (killerDrone != NULL) {
+        killerDrone->killed[drone->idx] = true;
+    }
 }
 
 void killDrone(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
@@ -831,7 +892,7 @@ void killDrone(iwEnv *e, droneEntity *drone, const wallEntity *killWall) {
         createDronePiece(e, drone, false);
     }
 
-    FS_BODY_IS_ACTIVE(&e->world, drone->body) = false;
+    fsWorld_SetActive(&e->world, drone->body, false);
     droneChangeWeapon(e, drone, e->defaultWeapon->type);
     drone->braking = false;
     drone->chargingBurst = false;
@@ -848,7 +909,7 @@ bool respawnDrone(iwEnv *e, droneEntity *drone) {
     }
     FS_BODY_POS(&e->world, drone->body) = pos;
     FS_BODY_ANGLE(&e->world, drone->body) = 0;
-    FS_BODY_IS_ACTIVE(&e->world, drone->body) = true;
+    fsWorld_SetActive(&e->world, drone->body, true);
     FS_BODY_VEL(&e->world, drone->body) = fsVec2_zero;
 
     drone->dead = false;
@@ -885,8 +946,8 @@ void createProjectile(iwEnv *e, droneEntity *drone, const fsVec2 normAim) {
     if (cellIdx == -1) {
         projectileInWall = true;
     } else {
-        const mapCell *cell = safe_array_get_at(e->cells, cellIdx);
-        if (cell->ent != NULL && entityTypeIsWall(cell->ent->type)) {
+        const mapCell *cell = cell_soa_get(&e->cells, cellIdx);
+        if (cell == NULL || (cell->ent != NULL && entityTypeIsWall(cell->ent->type))) {
             projectileInWall = true;
         }
     }
@@ -914,7 +975,7 @@ void createProjectile(iwEnv *e, droneEntity *drone, const fsVec2 normAim) {
     FS_BODY_IS_SENSOR(&e->world, idx) = drone->weaponInfo->hasSensor;
 
     projectileEntity *projectile;
-    if (cc_array_size(e->projectilePool) > 0) {
+    if (e->projectilePool != NULL && cc_array_size(e->projectilePool) > 0) {
         cc_array_remove_last(e->projectilePool, (void **)&projectile);
         memset(projectile, 0, sizeof(projectileEntity));
     } else {
@@ -949,7 +1010,8 @@ void createProjectile(iwEnv *e, droneEntity *drone, const fsVec2 normAim) {
     projectile->ent = ent;
     FS_BODY_USER_DATA(&e->world, idx) = ent;
 
-    cc_array_add(e->projectiles, projectile);
+    uint8_t soaIdx = projectile_soa_add(&e->projectiles, projectile);
+    ent->soaIndex = soaIdx;
 }
 
 void createProjectileExplosion(iwEnv *e, projectileEntity *projectile, const bool initalProjectile) {
@@ -957,10 +1019,13 @@ void createProjectileExplosion(iwEnv *e, projectileEntity *projectile, const boo
         return;
     }
     projectile->needsToBeDestroyed = true;
-    cc_array_add(e->explodingProjectiles, projectile);
+    // Add to exploding projectiles array for tracking
+    projectile_soa_add(&e->explodingProjectiles, projectile);
 
-    droneEntity *drone = safe_array_get_at(e->drones, projectile->droneIdx);
-    createExplosion(e, drone, projectile, projectile->pos, 2.0f, 10.0f, FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE);
+    droneEntity *drone = drone_soa_get(&e->drones, projectile->droneIdx);
+    if (drone != NULL) {
+        createExplosion(e, drone, projectile, projectile->pos, 2.0f, 10.0f, FLOATING_WALL_SHAPE | PROJECTILE_SHAPE | DRONE_SHAPE);
+    }
 }
 
 void fixProjectileSpeed(iwEnv *e, projectileEntity *projectile) {
@@ -989,54 +1054,79 @@ typedef struct wallBurstImpulse {
 
 void createExplosion(iwEnv *e, droneEntity *drone, const projectileEntity *projectile, const fsVec2 pos, float radius, float magnitude, uint32_t maskBits) {
     const bool isBurst = projectile == NULL;
-    
-    for (int i = 0; i < MAX_BODIES; i++) {
-        if (!FS_BODY_IS_ACTIVE(&e->world, i) || FS_BODY_IS_STATIC(&e->world, i)) continue;
-        if (!(FS_BODY_CATEGORY_BITS(&e->world, i) & maskBits)) continue;
+    const uint8_t srcIdx = isBurst ? drone->idx : projectile->droneIdx;
+    (void)srcIdx;
 
-        fsVec2 delta = fsSub(FS_BODY_POS(&e->world, i), pos);
-        float distSq = fsLengthSq(delta);
-        if (distSq < radius * radius) {
-            float dist = sqrtf(distSq);
-            fsVec2 dir = (dist < 0.001f) ? (fsVec2){0, 1} : fsMul(delta, 1.0f/dist);
-            float force = magnitude * (1.0f - dist/radius);
-            
-            // Check line of sight
-            if (posBehindWall(e, pos, FS_BODY_POS(&e->world, i), FS_BODY_USER_DATA(&e->world, i), 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
-                continue;
-            }
+    int32_t gMinX = (int32_t)floorf((pos.x - radius) * GRID_INV_SIZE);
+    int32_t gMinY = (int32_t)floorf((pos.y - radius) * GRID_INV_SIZE);
+    int32_t gMaxX = (int32_t)floorf((pos.x + radius) * GRID_INV_SIZE);
+    int32_t gMaxY = (int32_t)floorf((pos.y + radius) * GRID_INV_SIZE);
 
-            FS_BODY_VEL(&e->world, i) = fsAdd(FS_BODY_VEL(&e->world, i), fsMul(dir, force * FS_BODY_INV_MASS(&e->world, i)));
+    uint32_t checkedBodies[32];
+    uint8_t numChecked = 0;
+
+    for (int32_t x = gMinX; x <= gMaxX; x++) {
+        for (int32_t y = gMinY; y <= gMaxY; y++) {
+            uint32_t hash = fsGridHash(x, y);
+            const GridCell* cell = &e->world.grid[hash];
+            for (uint16_t k = 0; k < cell->count; k++) {
+                uint16_t i = cell->bodyIndices[k];
+                if (!FS_BODY_IS_ACTIVE(&e->world, i) || FS_BODY_IS_STATIC(&e->world, i)) continue;
+                if (!(FS_BODY_CATEGORY_BITS(&e->world, i) & maskBits)) continue;
+
+                bool alreadyChecked = false;
+                for (uint8_t c = 0; c < numChecked; c++) {
+                    if (checkedBodies[c] == i) { alreadyChecked = true; break; }
+                }
+                if (alreadyChecked) continue;
+                if (numChecked < 32) checkedBodies[numChecked++] = i;
+
+                fsVec2 delta = fsSub(FS_BODY_POS(&e->world, i), pos);
+                float distSq = fsLengthSq(delta);
+                if (distSq < radius * radius) {
+                    float dist = sqrtf(distSq);
+                    fsVec2 dir = (dist < 0.001f) ? (fsVec2){0, 1} : fsMul(delta, 1.0f/dist);
+                    float force = magnitude * (1.0f - dist/radius);
+                    
+                    // Check line of sight
+                    entity *ent = FS_BODY_USER_DATA(&e->world, i);
+                    if (ent != NULL && posBehindWall(e, pos, FS_BODY_POS(&e->world, i), ent, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
+                        continue;
+                    }
+
+                    FS_BODY_VEL(&e->world, i) = fsAdd(FS_BODY_VEL(&e->world, i), fsMul(dir, force * FS_BODY_INV_MASS(&e->world, i)));
             
-            entity *ent = FS_BODY_USER_DATA(&e->world, i);
-            if (ent && ent->type == DRONE_ENTITY) {
-                droneEntity *hitDrone = ent->entity;
-                uint8_t srcIdx = isBurst ? drone->idx : projectile->droneIdx;
-                hitDrone->contributions[srcIdx] = fsAdd(hitDrone->contributions[srcIdx], fsMul(dir, force * FS_BODY_INV_MASS(&e->world, i)));
-            } else if (ent && entityTypeIsWall(ent->type)) {
-                wallEntity *wall = ent->entity;
-                if (wall->isFloating) {
-                     uint8_t srcIdx = isBurst ? drone->idx : projectile->droneIdx;
-                     wall->contributions[srcIdx] = fsAdd(wall->contributions[srcIdx], fsMul(dir, force * FS_BODY_INV_MASS(&e->world, i)));
+                    if (ent && ent->type == DRONE_ENTITY) {
+                        droneEntity *hitDrone = ent->entity;
+                        hitDrone->contributions[srcIdx] = fsAdd(hitDrone->contributions[srcIdx], fsMul(dir, force * FS_BODY_INV_MASS(&e->world, i)));
+                    } else if (ent && entityTypeIsWall(ent->type)) {
+                        wallEntity *wall = ent->entity;
+                        if (wall->isFloating) {
+                             wall->contributions[srcIdx] = fsAdd(wall->contributions[srcIdx], fsMul(dir, force * FS_BODY_INV_MASS(&e->world, i)));
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool processExplosions, const bool full) {
+void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool processExplosions, const bool removeFromSoA) {
+    bool exploded = false;
     // explode projectile if necessary
     if (processExplosions && projectile->weaponInfo->explosive) {
         createProjectileExplosion(e, projectile, true);
+        exploded = true;
     }
 
     destroyEntity(e, projectile->ent);
     fsWorld_DestroyBody(&e->world, projectile->body);
 
-    if (full) {
-        enum cc_stat res = cc_array_remove_fast(e->projectiles, projectile, NULL);
-        MAYBE_UNUSED(res);
-        ASSERT(res == CC_OK);
+    // Remove if requested OR if we were supposed to explode but didn't (or aren't explosive)
+    if (removeFromSoA || !exploded) {
+        projectile_soa_remove(&e->projectiles, projectile->ent->soaIndex);
+    } else {
+        projectile->needsToBeDestroyed = true;
     }
 
     e->stats[projectile->droneIdx].shotDistances[projectile->weaponInfo->type] += projectile->distance;
@@ -1051,7 +1141,12 @@ void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool proces
         projectile->entsInBlackHole = NULL;
     }
 
-    cc_array_add(e->projectilePool, projectile);
+    // Return to pool or free
+    if (e->projectilePool != NULL) {
+        cc_array_add(e->projectilePool, projectile);
+    } else {
+        fastFree(projectile);
+    }
 }
 
 
@@ -1060,20 +1155,23 @@ void destroyProjectile(iwEnv *e, projectileEntity *projectile, const bool proces
 // can't be destroyed in explodeCallback because box2d assumes all shapes
 // and bodies are valid for the lifetime of an AABB query
 static inline void destroyExplodedProjectiles(iwEnv *e) {
-    if (cc_array_size(e->explodingProjectiles) == 0) {
+    uint8_t nExploding = projectile_soa_size(&e->explodingProjectiles);
+    if (nExploding == 0) {
         return;
     }
 
-    CC_ArrayIter iter;
-    cc_array_iter_init(&iter, e->explodingProjectiles);
-    projectileEntity *projectile;
-    while (cc_array_iter_next(&iter, (void **)&projectile) != CC_ITER_END) {
+    for (int16_t i = nExploding - 1; i >= 0; i--) {
+        projectileEntity *projectile = projectile_soa_get(&e->explodingProjectiles, i);
+        if (projectile == NULL) continue;
+        
+        // Remove from main projectiles SOA
+        projectile_soa_remove(&e->projectiles, projectile->ent->soaIndex);
+        
+        // Clean up resources (false for processExplosions to avoid recursion, 
+        // false for removeFromSoA because we just did it manually)
         destroyProjectile(e, projectile, false, false);
-        const enum cc_stat res = cc_array_remove_fast(e->projectiles, projectile, NULL);
-        MAYBE_UNUSED(res);
-        ASSERT(res == CC_OK);
     }
-    cc_array_remove_all(e->explodingProjectiles);
+    projectile_soa_remove_all(&e->explodingProjectiles);
 }
 
 void createSuddenDeathWalls(iwEnv *e, const fsVec2 startPos, const fsVec2 size) {
@@ -1101,7 +1199,10 @@ void createSuddenDeathWalls(iwEnv *e, const fsVec2 startPos, const fsVec2 size) 
         ERRORF("invalid position for sudden death wall: (%f, %f)", startPos.x, startPos.y);
     }
     for (uint16_t i = startIdx; i <= endIdx; i += indexIncrement) {
-        mapCell *cell = safe_array_get_at(e->cells, i);
+        mapCell *cell = cell_soa_get(&e->cells, i);
+        if (cell == NULL) {
+            continue;
+        }
         if (cell->ent != NULL) {
             if (cell->ent->type == WEAPON_PICKUP_ENTITY) {
                 weaponPickupEntity *pickup = cell->ent->entity;
@@ -1180,7 +1281,8 @@ void handleSuddenDeath(iwEnv *e) {
 
     // mark drones as dead if they touch a newly placed wall
     for (uint8_t i = 0; i < e->numDrones; i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
+        droneEntity *drone = drone_soa_get(&e->drones, i);
+        if (drone == NULL) continue;
         if (isOverlappingCircleInLineOfSight(e, drone->ent, drone->pos, DRONE_RADIUS, 0, WALL_SHAPE, NULL)) {
             killDrone(e, drone, NULL);
         }
@@ -1188,17 +1290,12 @@ void handleSuddenDeath(iwEnv *e) {
 
     // make floating walls static bodies if they are now overlapping with
     // a newly placed wall, but destroy them if they are fully inside a wall
-    CC_ArrayIter floatingWallIter;
-    cc_array_iter_init(&floatingWallIter, e->floatingWalls);
-    wallEntity *wall;
-    while (cc_array_iter_next(&floatingWallIter, (void **)&wall) != CC_ITER_END) {
-        const mapCell *cell = safe_array_get_at(e->cells, wall->mapCellIdx);
+    for (int16_t i = wall_soa_size(&e->floatingWalls) - 1; i >= 0; i--) {
+        wallEntity *wall = wall_soa_get(&e->floatingWalls, i);
+        if (wall == NULL) continue;
+        const mapCell *cell = cell_soa_get(&e->cells, wall->mapCellIdx);
         if (cell->ent != NULL && entityTypeIsWall(cell->ent->type)) {
             // floating wall is overlapping with a wall, destroy it
-            const enum cc_stat res = cc_array_iter_remove_fast(&floatingWallIter, NULL);
-            MAYBE_UNUSED(res);
-            ASSERT(res == CC_OK);
-
             const fsVec2 wallPos = wall->pos;
             MAYBE_UNUSED(wallPos);
             destroyWall(e, wall, false);
@@ -1208,13 +1305,11 @@ void handleSuddenDeath(iwEnv *e) {
     }
 
     // detroy all projectiles that are now overlapping with a newly placed wall
-    CC_ArrayIter projectileIter;
-    cc_array_iter_init(&projectileIter, e->projectiles);
-    projectileEntity *projectile;
-    while (cc_array_iter_next(&projectileIter, (void **)&projectile) != CC_ITER_END) {
-        const mapCell *cell = safe_array_get_at(e->cells, projectile->mapCellIdx);
+    for (int16_t i = projectile_soa_size(&e->projectiles) - 1; i >= 0; i--) {
+        projectileEntity *projectile = projectile_soa_get(&e->projectiles, i);
+        if (projectile == NULL) continue;
+        const mapCell *cell = cell_soa_get(&e->cells, projectile->mapCellIdx);
         if (cell->ent != NULL && entityTypeIsWall(cell->ent->type)) {
-            cc_array_iter_remove_fast(&projectileIter, NULL);
             destroyProjectile(e, projectile, false, false);
         }
     }
@@ -1241,6 +1336,9 @@ void droneShoot(iwEnv *e, droneEntity *drone, const fsVec2 aim, const bool charg
     // and only cool down after the next shot was skipped
     drone->heat++;
     if (drone->weaponCooldown != 0.0f) {
+        return;
+    }
+    if (drone->weaponInfo == NULL) {
         return;
     }
     const bool weaponNeedsCharge = drone->weaponInfo->charge != 0.0f;
@@ -1387,7 +1485,7 @@ void droneBurst(iwEnv *e, droneEntity *drone) {
 
     if (e->client != NULL) {
         explosionInfo *explInfo;
-        if (cc_array_size(e->explosionPool) > 0) {
+        if (e->explosionPool != NULL && cc_array_size(e->explosionPool) > 0) {
             cc_array_remove_last(e->explosionPool, (void **)&explInfo);
             memset(explInfo, 0, sizeof(explosionInfo));
         } else {
@@ -1399,7 +1497,7 @@ void droneBurst(iwEnv *e, droneEntity *drone) {
         explInfo->isBurst = true;
         explInfo->droneIdx = drone->idx;
         explInfo->renderSteps = UINT16_MAX;
-        cc_array_add(e->explosions, explInfo);
+        explosion_soa_add(&e->explosions, explInfo);
     }
 
 }
@@ -1484,17 +1582,13 @@ bool droneStep(iwEnv *e, droneEntity *drone) {
 void handleBlackHolePull(iwEnv *e, projectileEntity *projectile) {
     ASSERT(projectile->weaponInfo->type == BLACK_HOLE_WEAPON);
 
-    CC_ArrayIter entIter;
-    cc_array_iter_init(&entIter, projectile->entsInBlackHole);
-    entityID *id;
-    while (cc_array_iter_next(&entIter, (void **)&id) != CC_ITER_END) {
+    for (int16_t i = cc_array_size(projectile->entsInBlackHole) - 1; i >= 0; i--) {
+        entityID *id = safe_array_get_at(projectile->entsInBlackHole, i);
         // check if the entity is still valid
         const entity *ent = getEntityByID(e, *id);
         if (ent == NULL) {
             fastFree(id);
-            enum cc_stat res = cc_array_iter_remove_fast(&entIter, NULL);
-            MAYBE_UNUSED(res);
-            ASSERT(res == CC_OK);
+            cc_array_remove_fast_at(projectile->entsInBlackHole, i, NULL);
             continue;
         }
         fsBodyIndex body = FS_BODY_INVALID;
@@ -1554,10 +1648,9 @@ void handleBlackHolePull(iwEnv *e, projectileEntity *projectile) {
     }
 }
 void projectilesStep(iwEnv *e) {
-    CC_ArrayIter projIter;
-    cc_array_iter_init(&projIter, e->projectiles);
-    projectileEntity *projectile;
-    while (cc_array_iter_next(&projIter, (void **)&projectile) != CC_ITER_END) {
+    for (int16_t i = projectile_soa_size(&e->projectiles) - 1; i >= 0; i--) {
+        projectileEntity *projectile = projectile_soa_get(&e->projectiles, i);
+        if (projectile == NULL) continue;
         if (projectile->needsToBeDestroyed) {
             continue;
         }
@@ -1569,15 +1662,12 @@ void projectilesStep(iwEnv *e) {
             bool destroyed = false;
             for (uint8_t i = 0; i < projectile->numDronesBehindWalls; i++) {
                 const uint8_t droneIdx = projectile->dronesBehindWalls[i];
-                const droneEntity *drone = safe_array_get_at(e->drones, droneIdx);
+                const droneEntity *drone = drone_soa_get(&e->drones, droneIdx);
                 if (posBehindWall(e, projectile->pos, drone->pos, NULL, 0, WALL_SHAPE | FLOATING_WALL_SHAPE, NULL)) {
                     continue;
                 }
 
                 destroyProjectile(e, projectile, true, false);
-                enum cc_stat res = cc_array_iter_remove_fast(&projIter, NULL);
-                MAYBE_UNUSED(res);
-                ASSERT(res == CC_OK);
                 destroyed = true;
                 break;
             }
@@ -1594,12 +1684,7 @@ void projectilesStep(iwEnv *e) {
             continue;
         }
         if (projectile->distance >= maxDistance) {
-            // we have to destroy the projectile using the iterator so
-            // we can continue to iterate correctly
             destroyProjectile(e, projectile, true, false);
-            enum cc_stat res = cc_array_iter_remove_fast(&projIter, NULL);
-            MAYBE_UNUSED(res);
-            ASSERT(res == CC_OK);
             continue;
         }
     }
@@ -1608,13 +1693,12 @@ void projectilesStep(iwEnv *e) {
 }
 
 void weaponPickupsStep(iwEnv *e) {
-    CC_ArrayIter iter;
-    cc_array_iter_init(&iter, e->pickups);
-    weaponPickupEntity *pickup;
+    for (int16_t i = pickup_soa_size(&e->pickups) - 1; i >= 0; i--) {
+        weaponPickupEntity *pickup = pickup_soa_get(&e->pickups, i);
+        if (pickup == NULL) continue;
 
-    // respawn weapon pickups at a random location as a random weapon type
-    // once the respawn wait has elapsed
-    while (cc_array_iter_next(&iter, (void **)&pickup) != CC_ITER_END) {
+        // respawn weapon pickups at a random location as a random weapon type
+        // once the respawn wait has elapsed
         if (pickup->respawnWait == 0.0f) {
             continue;
         }
@@ -1625,9 +1709,6 @@ void weaponPickupsStep(iwEnv *e) {
 
         fsVec2 pos;
         if (!findOpenPos(e, WEAPON_PICKUP_SHAPE, &pos, -1)) {
-            const enum cc_stat res = cc_array_iter_remove_fast(&iter, NULL);
-            MAYBE_UNUSED(res);
-            ASSERT(res == CC_OK);
             DEBUG_LOG("destroying weapon pickup");
             destroyWeaponPickup(e, pickup);
             continue;
@@ -1643,19 +1724,21 @@ void weaponPickupsStep(iwEnv *e) {
         pickup->mapCellIdx = cellIdx;
         createWeaponPickupBodyShape(e, pickup);
 
-        mapCell *cell = safe_array_get_at(e->cells, cellIdx);
+        mapCell *cell = cell_soa_get(&e->cells, cellIdx);
         cell->ent = pickup->ent;
     }
 }
 
 void handleBodyMoveEvents(iwEnv *e) {
-    for (int i = 0; i < MAX_BODIES; i++) {
-        if (!FS_BODY_IS_ACTIVE(&e->world, i) || FS_BODY_IS_STATIC(&e->world, i)) continue;
+    // Use cached active indices from fsWorld_Step to avoid iterating through all MAX_BODIES
+    for (uint16_t i = 0; i < e->world.activeCount; i++) {
+        uint16_t idx = e->world.activeIndices[i];
+        if (FS_BODY_IS_STATIC(&e->world, idx)) continue;
 
-        entity *ent = FS_BODY_USER_DATA(&e->world, i);
-        if (ent == NULL) continue;
+        entity *ent = FS_BODY_USER_DATA(&e->world, idx);
+        if (ent == NULL || ent->id == -1) continue;
 
-        fsVec2 newPos = FS_BODY_POS(&e->world, i);
+        fsVec2 newPos = FS_BODY_POS(&e->world, idx);
         int16_t mapIdx;
 
         switch (ent->type) {
@@ -1665,13 +1748,13 @@ void handleBodyMoveEvents(iwEnv *e) {
             wallEntity *wall = ent->entity;
             mapIdx = entityPosToCellIdx(e, newPos);
             if (mapIdx == -1) {
-                cc_array_remove_fast(e->floatingWalls, wall, NULL);
+                wall_soa_remove(&e->floatingWalls, wall->ent->soaIndex);
                 destroyWall(e, wall, false);
                 continue;
             }
             wall->mapCellIdx = mapIdx;
             wall->pos = newPos;
-            wall->velocity = FS_BODY_VEL(&e->world, i);
+            wall->velocity = FS_BODY_VEL(&e->world, idx);
             break;
         }
         case PROJECTILE_ENTITY: {
@@ -1685,7 +1768,7 @@ void handleBodyMoveEvents(iwEnv *e) {
             proj->lastPos = proj->pos;
             proj->pos = newPos;
             proj->lastVelocity = proj->velocity;
-            proj->velocity = FS_BODY_VEL(&e->world, i);
+            proj->velocity = FS_BODY_VEL(&e->world, idx);
             if (proj->weaponInfo->damping != 0.0f) {
                 proj->lastSpeed = proj->speed;
                 proj->speed = fsLength(proj->velocity);
@@ -1706,7 +1789,7 @@ void handleBodyMoveEvents(iwEnv *e) {
             drone->lastPos = drone->pos;
             drone->pos = newPos;
             drone->lastVelocity = drone->velocity;
-            drone->velocity = FS_BODY_VEL(&e->world, i);
+            drone->velocity = FS_BODY_VEL(&e->world, idx);
             if (e->client != NULL) {
                 updateTrailPoints(&drone->trailPoints, MAX_DRONE_TRAIL_POINTS, newPos);
             }
@@ -1766,14 +1849,17 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
         if (ent->type == BOUNCY_WALL_ENTITY) return false;
     } else if (ent->type == SHIELD_ENTITY) {
         shieldEntity *shield = ent->entity;
-        if (shield->health <= 0.0f) return false;
+        if (shield == NULL || shield->health <= 0.0f) return false;
         const float damage = projectile->lastSpeed * projectile->weaponInfo->mass * DRONE_SHIELD_HEALTH_IMPULSE_COEF;
         shield->health -= damage;
         if (shield->health <= 0.0f) {
-            droneEntity *parentDrone = safe_array_get_at(e->drones, projectile->droneIdx);
-            droneAddEnergy(parentDrone, DRONE_SHIELD_BREAK_ENERGY_REFILL);
-            parentDrone->stepInfo.brokeShield[shield->drone->idx] = true;
-            e->stats[parentDrone->idx].shieldsBroken++;
+            droneEntity *parentDrone = drone_soa_get(&e->drones, projectile->droneIdx);
+            // Validate drone index is within bounds to prevent accessing freed memory
+            if (projectile->droneIdx < drone_soa_size(&e->drones) && parentDrone != NULL && !parentDrone->dead && shield->drone != NULL && !shield->drone->dead && shield->drone->idx < _MAX_DRONES) {
+                droneAddEnergy(parentDrone, DRONE_SHIELD_BREAK_ENERGY_REFILL);
+                parentDrone->stepInfo.brokeShield[shield->drone->idx] = true;
+                e->stats[parentDrone->idx].shieldsBroken++;
+            }
         }
         return false;
     }
@@ -1789,15 +1875,21 @@ uint8_t handleProjectileBeginContact(iwEnv *e, const entity *proj, const entity 
         float hitStrength = fsLength(hitImpulse);
 
         if (projectile->droneIdx != hitDrone->idx) {
-            droneEntity *shooterDrone = safe_array_get_at(e->drones, projectile->droneIdx);
-            if (shooterDrone->team != hitDrone->team) {
-                const float impulseEnergy = projectile->lastSpeed * projectile->weaponInfo->mass * projectile->weaponInfo->energyRefillCoef;
-                droneAddEnergy(shooterDrone, impulseEnergy);
+            droneEntity *shooterDrone = drone_soa_get(&e->drones, projectile->droneIdx);
+            if (shooterDrone != NULL) {
+                if (shooterDrone->team != hitDrone->team) {
+                    const float impulseEnergy = projectile->lastSpeed * projectile->weaponInfo->mass * projectile->weaponInfo->energyRefillCoef;
+                    droneAddEnergy(shooterDrone, impulseEnergy);
+                }
+                if (hitDrone->idx < _MAX_DRONES) {
+                    shooterDrone->stepInfo.shotHit[hitDrone->idx] += hitStrength;
+                }
+                if (shooterDrone->idx < _MAX_DRONES) {
+                    hitDrone->stepInfo.shotTaken[shooterDrone->idx] += hitStrength;
+                }
+                e->stats[shooterDrone->idx].shotsHit[projectile->weaponInfo->type]++;
+                e->stats[shooterDrone->idx].totalShotsHit++;
             }
-            shooterDrone->stepInfo.shotHit[hitDrone->idx] += hitStrength;
-            e->stats[shooterDrone->idx].shotsHit[projectile->weaponInfo->type]++;
-            e->stats[shooterDrone->idx].totalShotsHit++;
-            hitDrone->stepInfo.shotTaken[shooterDrone->idx] += hitStrength;
             e->stats[hitDrone->idx].shotsTaken[projectile->weaponInfo->type]++;
             e->stats[hitDrone->idx].totalShotsTaken++;
         } else {
@@ -1856,6 +1948,7 @@ void handleContactEvents(iwEnv *e) {
         const fsContactEvent *event = &e->world.events[i];
         entity *e1 = FS_BODY_USER_DATA(&e->world, event->a);
         entity *e2 = FS_BODY_USER_DATA(&e->world, event->b);
+        // Skip events with NULL user data (freed entities)
         if (e1 == NULL || e2 == NULL) continue;
 
         if (event->type == FS_CONTACT_BEGIN) {
@@ -2047,44 +2140,53 @@ void handleProjectileEndTouch(iwEnv *e, const entity *sensor, entity *visitor) {
 }
 
 void findNearWalls(const iwEnv *e, const droneEntity *drone, nearEntity nearestWalls[], const uint8_t nWalls) {
-    nearEntity nearWalls[MAX_NEAREST_WALLS];
+    // Use bounded selection instead of full sort for MAX_NEAREST_WALLS (8) elements
+    for (uint8_t i = 0; i < nWalls; i++) {
+        nearestWalls[i].entity = NULL;
+        nearestWalls[i].distanceSquared = FLT_MAX;
+    }
 
     for (uint8_t i = 0; i < MAX_NEAREST_WALLS; ++i) {
         const uint32_t idx = (MAX_NEAREST_WALLS * drone->mapCellIdx) + i;
-        const uint16_t wallIdx = e->map->nearestWalls[idx].idx;
-        wallEntity *wall = safe_array_get_at(e->walls, wallIdx);
-        nearWalls[i].entity = wall;
-        nearWalls[i].distanceSquared = fsDistanceSq(drone->pos, wall->pos);
-    }
-    insertionSort(nearWalls, MAX_NEAREST_WALLS);
-    memcpy(nearestWalls, nearWalls, nWalls * sizeof(nearEntity));
-}
+        const uint16_t wallIdx = e->nearestWalls[idx].idx;
+        wallEntity *wall = wall_soa_get(&e->walls, wallIdx);
+        if (wall == NULL) continue;
+        const float d2 = fsDistanceSq(drone->pos, wall->pos);
 
-void dampTrackedPhysics(iwEnv *e) {
-    for (uint8_t i = 0; i < e->numDrones; i++) {
-        droneEntity *drone = safe_array_get_at(e->drones, i);
-        if (drone->dead) {
+        // Fast reject if we already have nWalls entries and this is worse than the worst
+        if (nearestWalls[nWalls - 1].entity != NULL && d2 >= nearestWalls[nWalls - 1].distanceSquared) {
             continue;
         }
 
+        // Insert into sorted array by distance
+        int8_t j;
+        for (j = nWalls - 1; j > 0 && nearestWalls[j - 1].entity != NULL && nearestWalls[j - 1].distanceSquared > d2; j--) {
+            nearestWalls[j] = nearestWalls[j - 1];
+        }
+        nearestWalls[j].entity = wall;
+        nearestWalls[j].distanceSquared = d2;
+    }
+}
+
+void dampTrackedPhysics(iwEnv *e) {
+    const uint8_t nDrones = drone_soa_size(&e->drones);
+    for (uint8_t i = 0; i < nDrones; i++) {
         float droneDamping = DRONE_LINEAR_DAMPING;
-        if (drone->braking) {
+        if (e->drones.brakings[i]) {
             droneDamping *= DRONE_BRAKE_DAMPING_COEF;
         }
 
         const float damp = 1.0f / (1.0f + (droneDamping * e->deltaTime));
         for (uint8_t k = 0; k < e->numDrones; k++) {
-            drone->contributions[k] = fsMul(drone->contributions[k], damp);
+            e->drones.contributions[i][k] = fsMul(e->drones.contributions[i][k], damp);
         }
     }
 
-    CC_ArrayIter wallIter;
-    cc_array_iter_init(&wallIter, e->floatingWalls);
-    wallEntity *wall;
-    while (cc_array_iter_next(&wallIter, (void **)&wall) != CC_ITER_END) {
+    const uint16_t nWalls = wall_soa_size(&e->floatingWalls);
+    for (uint16_t i = 0; i < nWalls; i++) {
         const float damp = 1.0f / (1.0f + (FLOATING_WALL_DAMPING * e->deltaTime));
         for (uint8_t k = 0; k < e->numDrones; k++) {
-            wall->contributions[k] = fsMul(wall->contributions[k], damp);
+            e->floatingWalls.contributions[i][k] = fsMul(e->floatingWalls.contributions[i][k], damp);
         }
     }
 }

@@ -19,33 +19,35 @@
 #define action_mask masks
 #include "../../src/vecenv.h"
 
-// Create vec of envs and initialize shared maps + per-env setup
+// Create vec of envs and initialize shared maps + per-env setup+
+
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
                  Dict* vec_kwargs, Dict* env_kwargs) {
     int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int agents_per_buffer = total_agents / num_buffers;
 
-    // Allocate max possible envs (1 agent per env worst case)
-    Env* envs = (Env*)calloc(total_agents, sizeof(Env));
+    // Initialize shared maps once (no environment needed - computes purely from static layout data)
+    initMaps();
 
+    // First pass: count how many envs we need without initializing them
     int num_envs = 0;
     int agents_created = 0;
     while (agents_created < total_agents) {
-        srand(num_envs);
-        // default my_init will populate env->numAgents etc
-        my_init(&envs[num_envs], env_kwargs);
-        agents_created += envs[num_envs].numAgents;
+        // Each env has 2 agents by default (will be set in my_init)
+        agents_created += 2;
         num_envs++;
     }
 
-    // Shrink to actual size needed
-    envs = (Env*)realloc(envs, num_envs * sizeof(Env));
+    // Allocate exact number of envs needed (no realloc to avoid invalidating internal pointers)
+    Env* envs = (Env*)calloc(num_envs, sizeof(Env));
 
-    // Initialize shared maps once and call per-env setup
-    initMaps(&envs[0]);
+    // Second pass: initialize the envs
+    agents_created = 0;
     for (int i = 0; i < num_envs; i++) {
-        setupEnv(&envs[i]);
+        srand(i);
+        my_init(&envs[i], env_kwargs);
+        agents_created += envs[i].numAgents;
     }
 
     // Fill buffer info by iterating through envs
@@ -106,6 +108,8 @@ void my_init(Env* e, Dict* kwargs) {
         (float)dict_get(kwargs, "reward_shot_hit_coef")->value,
         (float)dict_get(kwargs, "reward_explosion_hit_coef")->value
     );
+
+    setupEnv(e);
 }
 
 // Logging: convert env Log to Dict values

@@ -5,6 +5,7 @@
 #include <float.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 #include <string.h>
 
 typedef struct fsVec2 {
@@ -174,14 +175,16 @@ static inline bool fsTestCircleBox(fsVec2 cp, float r, fsVec2 bp, fsVec2 bh, fsR
 
 #define MAX_BODIES 1024
 
-// Spatial hash grid for broadphase optimization
-#define GRID_CELL_SIZE 64.0f
+// Spatial hash grid for broadphase optimization - tuned for map scale
+#define GRID_CELL_SIZE 12.0f
+#define GRID_INV_SIZE (1.0f / GRID_CELL_SIZE)
 #define GRID_TABLE_SIZE 4096
-#define MAX_GRID_BODIES 16
+#define MAX_GRID_BODIES 32
 
 typedef struct GridCell {
     uint16_t bodyIndices[MAX_GRID_BODIES];
     uint16_t count;
+    uint32_t stamp; // for lazy clearing (cell is valid only if stamp == world->gridStamp)
 } GridCell;
 
 typedef enum fsContactType {
@@ -250,17 +253,41 @@ typedef struct fsWorld {
     uint32_t currentTimestamp;
     uint16_t freeList[MAX_BODIES];
     uint16_t freeListCount;
+    uint16_t activeIndices[MAX_BODIES];
+    uint16_t activeCount;
+    uint16_t activePos[MAX_BODIES]; // index->position in activeIndices for O(1) removal
+    uint32_t gridStamp; // stamp for lazy grid clearing
 } fsWorld;
 
 static inline void fsWorld_Init(fsWorld* w, fsVec2 gravity) {
     memset(w, 0, sizeof(fsWorld));
     w->gravity = gravity;
+    w->gridStamp = 1;
     // Initialize free list with all body indices in reverse order
     for (uint16_t i = 0; i < MAX_BODIES; i++) {
         w->freeList[i] = MAX_BODIES - 1 - i;
         w->cachedRotations[i] = fsRot_identity;
     }
     w->freeListCount = MAX_BODIES;
+}
+
+// Maintain activeIndices/activeCount without scanning MAX_BODIES each step.
+static inline void fsWorld_SetActive(fsWorld* w, fsBodyIndex index, bool active) {
+    if (index == FS_BODY_INVALID) return;
+    if (active) {
+        if (w->isActive[index]) return;
+        w->isActive[index] = true;
+        w->activePos[index] = w->activeCount;
+        w->activeIndices[w->activeCount++] = index;
+    } else {
+        if (!w->isActive[index]) return;
+        w->isActive[index] = false;
+        uint16_t pos = w->activePos[index];
+        uint16_t lastIdx = w->activeIndices[w->activeCount - 1];
+        w->activeIndices[pos] = lastIdx;
+        w->activePos[lastIdx] = pos;
+        w->activeCount--;
+    }
 }
 
 // Get rotation matrix, using cached version for static bodies
@@ -318,29 +345,23 @@ static inline bool fsGridQueryAABB(GridCell* grid, fsAABB query, uint32_t maskBi
     int32_t minY = (int32_t)floorf(query.min.y / GRID_CELL_SIZE);
     int32_t maxY = (int32_t)floorf(query.max.y / GRID_CELL_SIZE);
 
-    uint16_t checked[MAX_BODIES];
-    uint16_t checkedCount = 0;
+    // Bitset for deduplication (MAX_BODIES/8 bytes)
+    uint8_t checked[(MAX_BODIES + 7) / 8] = {0};
 
     for (int32_t x = minX; x <= maxX; x++) {
         for (int32_t y = minY; y <= maxY; y++) {
             uint32_t hash = fsGridHash(x, y);
             GridCell* cell = &grid[hash];
+            if (cell->stamp != w->gridStamp) continue;
 
             for (uint16_t i = 0; i < cell->count; i++) {
                 uint16_t bodyIdx = cell->bodyIndices[i];
 
-                // Skip if already checked
-                bool alreadyChecked = false;
-                for (uint16_t j = 0; j < checkedCount; j++) {
-                    if (checked[j] == bodyIdx) {
-                        alreadyChecked = true;
-                        break;
-                    }
-                }
-                if (alreadyChecked) continue;
-                if (checkedCount < MAX_BODIES) {
-                    checked[checkedCount++] = bodyIdx;
-                }
+                // Skip if already checked using bitset
+                uint16_t byteIdx = bodyIdx / 8;
+                uint8_t bitMask = 1 << (bodyIdx % 8);
+                if (checked[byteIdx] & bitMask) continue;
+                checked[byteIdx] |= bitMask;
 
                 // Check mask bits
                 if (!(w->categoryBits[bodyIdx] & maskBits)) continue;
@@ -374,24 +395,27 @@ static inline fsBodyIndex fsWorld_CreateBody(fsWorld* w) {
     w->restitutions[index] = 1.0f;
     memset(&w->shapes[index], 0, sizeof(fsShape));
     w->userDatas[index] = NULL;
-    w->isActive[index] = true;
+    w->isActive[index] = false;
     w->isStatic[index] = false;
     w->isSensor[index] = false;
     w->categoryBits[index] = 0;
     w->maskBits[index] = 0;
     w->boundingRadii[index] = 0.0f;
-    w->gridMinX[index] = 0; w->gridMaxX[index] = 0;
-    w->gridMinY[index] = 0; w->gridMaxY[index] = 0;
+    // Sentinel values so static bodies can cache grid bounds once without ambiguity.
+    w->gridMinX[index] = INT32_MIN; w->gridMaxX[index] = INT32_MIN;
+    w->gridMinY[index] = INT32_MIN; w->gridMaxY[index] = INT32_MIN;
     w->cachedRotations[index] = fsRot_identity;
     w->rotationCached[index] = false;
+    fsWorld_SetActive(w, index, true);
     return index;
 }
 
 static inline void fsWorld_DestroyBody(fsWorld* w, fsBodyIndex index) {
     if (index == FS_BODY_INVALID) return;
-    w->isActive[index] = false;
+    fsWorld_SetActive(w, index, false);
     w->categoryBits[index] = 0;
     w->maskBits[index] = 0;
+    w->userDatas[index] = NULL;
     // Return body to free list
     w->freeList[w->freeListCount++] = index;
 }
@@ -453,22 +477,31 @@ static inline void fsResolveCollision(fsWorld* w, fsContact* c) {
 }
 
 static inline void fsWorld_Step(fsWorld* w, float dt) {
-    uint16_t activeIndices[MAX_BODIES];
-    uint16_t activeCount = 0;
-    #pragma clang loop vectorize(enable)
-    for (uint16_t i = 0; i < MAX_BODIES; i++) {
-        if (w->isActive[i]) {
-            activeIndices[activeCount++] = i;
-        }
-    }
-
     // 1. Integration & cache updates
     #pragma clang loop vectorize(enable)
-    for (uint16_t i = 0; i < activeCount; i++) {
-        uint16_t idx = activeIndices[i];
+    for (uint16_t i = 0; i < w->activeCount; i++) {
+        uint16_t idx = w->activeIndices[i];
+
+        // Cache bounding radius (shapes are stable in impulse_wars; compute once)
+        if (__builtin_expect(w->boundingRadii[idx] == 0.0f, 0)) {
+            w->boundingRadii[idx] = fsShapeBoundingRadius(&w->shapes[idx]);
+        }
+
+        // Static bodies don't move: avoid per-step integration and bounds recomputation.
+        // Their cached grid bounds are still valid for broadphase insertion.
+        if (w->isStatic[idx]) {
+            // Ensure grid bounds are computed at least once.
+            if (__builtin_expect(w->gridMinX[idx] == INT32_MIN, 0)) {
+                const float r = w->boundingRadii[idx];
+                w->gridMinX[idx] = (int32_t)floorf((w->positions[idx].x - r) / GRID_CELL_SIZE);
+                w->gridMaxX[idx] = (int32_t)floorf((w->positions[idx].x + r) / GRID_CELL_SIZE);
+                w->gridMinY[idx] = (int32_t)floorf((w->positions[idx].y - r) / GRID_CELL_SIZE);
+                w->gridMaxY[idx] = (int32_t)floorf((w->positions[idx].y + r) / GRID_CELL_SIZE);
+            }
+            continue;
+        }
+
         fsBody_Integrate(w, idx, dt);
-        // Cache bounding radius and grid cell bounds
-        w->boundingRadii[idx] = fsShapeBoundingRadius(&w->shapes[idx]);
         const float r = w->boundingRadii[idx];
         w->gridMinX[idx] = (int32_t)floorf((w->positions[idx].x - r) / GRID_CELL_SIZE);
         w->gridMaxX[idx] = (int32_t)floorf((w->positions[idx].x + r) / GRID_CELL_SIZE);
@@ -477,25 +510,57 @@ static inline void fsWorld_Step(fsWorld* w, float dt) {
     }
 
     // 2. Build spatial hash grid for broadphase
-    fsGridClear(w->grid);
-    #pragma clang loop vectorize(enable)
-    for (uint16_t i = 0; i < activeCount; i++) {
-        uint16_t idx = activeIndices[i];
-        fsGridInsert(w->grid, w->positions[idx], w->boundingRadii[idx], idx);
+    // Lazy-clear grid using per-cell stamps (avoid memset of GRID_TABLE_SIZE every step)
+    w->gridStamp++;
+    if (__builtin_expect(w->gridStamp == 0, 0)) {
+        // Extremely rare wrap-around: reset all stamps
+        for (uint32_t i = 0; i < GRID_TABLE_SIZE; i++) {
+            w->grid[i].stamp = 0;
+            w->grid[i].count = 0;
+        }
+        w->gridStamp = 1;
+    }
+
+    for (uint16_t i = 0; i < w->activeCount; i++) {
+        uint16_t idx = w->activeIndices[i];
+        const int32_t minX = w->gridMinX[idx];
+        const int32_t maxX = w->gridMaxX[idx];
+        const int32_t minY = w->gridMinY[idx];
+        const int32_t maxY = w->gridMaxY[idx];
+
+        for (int32_t x = minX; x <= maxX; x++) {
+            for (int32_t y = minY; y <= maxY; y++) {
+                uint32_t hash = fsGridHash(x, y);
+                GridCell* cell = &w->grid[hash];
+                if (cell->stamp != w->gridStamp) {
+                    cell->stamp = w->gridStamp;
+                    cell->count = 0;
+                }
+                if (cell->count < MAX_GRID_BODIES) {
+                    cell->bodyIndices[cell->count++] = idx;
+                }
+            }
+        }
     }
 
     // 3. Collision detection & resolution using spatial grid
     w->currentTimestamp++;
-    
-    for (uint16_t i = 0; i < activeCount; i++) {
-        uint16_t idxA = activeIndices[i];
+
+    for (uint16_t i = 0; i < w->activeCount; i++) {
+        uint16_t idxA = w->activeIndices[i];
         const float radius = w->boundingRadii[idxA];
         const uint32_t catA = w->categoryBits[idxA];
         const uint32_t maskA = w->maskBits[idxA];
         const bool staticA = w->isStatic[idxA];
         const bool sensorA = w->isSensor[idxA];
         const fsVec2 posA = w->positions[idxA];
-        
+
+        // Static bodies don't need to initiate collision queries.
+        // Dynamic bodies querying the grid will still find and resolve against statics.
+        if (__builtin_expect(staticA, 0)) {
+            continue;
+        }
+
         // Use cached grid cell bounds
         const int32_t minX = w->gridMinX[idxA];
         const int32_t maxX = w->gridMaxX[idxA];
@@ -507,15 +572,16 @@ static inline void fsWorld_Step(fsWorld* w, float dt) {
             for (int32_t y = minY; y <= maxY; y++) {
                 uint32_t hash = fsGridHash(x, y);
                 GridCell* cell = &w->grid[hash];
-                
+                if (__builtin_expect(cell->stamp != w->gridStamp, 0)) continue;
+
                 for (uint16_t k = 0; k < cell->count; k++) {
                     uint16_t idxB = cell->bodyIndices[k];
                     if (__builtin_expect(idxB == idxA, 0)) continue;
-                    
+
                     // Avoid checking the same pair twice using timestamp
                     if (__builtin_expect(w->pairCheckTimestamp[idxB] == w->currentTimestamp, 0)) continue;
                     w->pairCheckTimestamp[idxB] = w->currentTimestamp;
-                    
+
                     // Early static-static and category/mask checks
                     if (__builtin_expect(staticA && w->isStatic[idxB], 0)) continue;
                     if (__builtin_expect(!(catA & w->maskBits[idxB]) && !(w->categoryBits[idxB] & maskA), 0)) continue;
@@ -529,7 +595,7 @@ static inline void fsWorld_Step(fsWorld* w, float dt) {
 
                     fsContact contact;
                     bool hit = false;
-                    
+
                     if (w->shapes[idxA].type == FS_CIRCLE && w->shapes[idxB].type == FS_CIRCLE) {
                         hit = fsTestCircleCircle(posA, w->shapes[idxA].circle.radius, w->positions[idxB], w->shapes[idxB].circle.radius, &contact);
                     } else if (w->shapes[idxA].type == FS_CIRCLE && w->shapes[idxB].type == FS_BOX) {
@@ -539,14 +605,14 @@ static inline void fsWorld_Step(fsWorld* w, float dt) {
                         // Flip normal
                         contact.normal = fsMul(contact.normal, -1.0f);
                     }
-                    
+
                     if (__builtin_expect(hit, 0)) {
                         contact.a = idxA;
                         contact.b = idxB;
                         if (!sensorA && !w->isSensor[idxB]) {
                             fsResolveCollision(w, &contact);
                         }
-                        
+
                         if (__builtin_expect(w->numEvents < MAX_EVENTS, 1)) {
                             w->events[w->numEvents++] = (fsContactEvent){
                                 .type = FS_CONTACT_BEGIN,
@@ -571,38 +637,84 @@ typedef struct fsRayCastResult {
 
 static inline bool fsRayCast(fsWorld* w, fsVec2 start, fsVec2 dir, float maxFraction, uint32_t mask, fsRayCastResult* out) {
     const float dirLen = fsLength(dir);
-    if (dirLen <= FLT_EPSILON) {
-        return false;
-    }
+    if (dirLen <= FLT_EPSILON) return false;
+    const float invDirLen = 1.0f / dirLen;
+    
+    fsVec2 end = fsAdd(start, fsMul(dir, maxFraction));
+    float minX = fminf(start.x, end.x);
+    float minY = fminf(start.y, end.y);
+    float maxX = fmaxf(start.x, end.x);
+    float maxY = fmaxf(start.y, end.y);
+
+    int32_t gMinX = (int32_t)floorf(minX * GRID_INV_SIZE);
+    int32_t gMinY = (int32_t)floorf(minY * GRID_INV_SIZE);
+    int32_t gMaxX = (int32_t)floorf(maxX * GRID_INV_SIZE);
+    int32_t gMaxY = (int32_t)floorf(maxY * GRID_INV_SIZE);
+
     float minFraction = maxFraction;
     bool hit = false;
-    
-    for (uint16_t i = 0; i < MAX_BODIES; i++) {
-        if (!w->isActive[i]) continue;
-        if (!(w->categoryBits[i] & mask)) continue;
-        
-        // Simple ray-circle or ray-box
-        if (w->shapes[i].type == FS_CIRCLE) {
-            fsVec2 m = fsSub(start, w->positions[i]);
-            float c = fsDot(m, m) - w->shapes[i].circle.radius * w->shapes[i].circle.radius;
-            float b_dot = fsDot(m, dir);
-            if (c > 0.0f && b_dot > 0.0f) continue;
-            float discr = b_dot * b_dot - c;
-            if (discr < 0.0f) continue;
-            float t = -b_dot - sqrtf(discr);
-            if (t < 0.0f) t = 0.0f;
-            float f = t / dirLen;
-            if (f < minFraction) {
-                minFraction = f;
-                out->bodyIndex = i;
-                out->point = fsAdd(start, fsMul(dir, f));
-                out->normal = fsNormalize(fsSub(out->point, w->positions[i]));
-                out->fraction = f;
-                hit = true;
+    uint32_t checkedBodies[32]; // Small cache to avoid re-checking bodies in multiple cells
+    uint8_t numChecked = 0;
+
+    for (int32_t x = gMinX; x <= gMaxX; x++) {
+        for (int32_t y = gMinY; y <= gMaxY; y++) {
+            uint32_t hash = fsGridHash(x, y);
+            GridCell* cell = &w->grid[hash];
+            if (cell->stamp != w->gridStamp) continue;
+            for (uint16_t k = 0; k < cell->count; k++) {
+                uint16_t i = cell->bodyIndices[k];
+                if (!w->isActive[i] || !(w->categoryBits[i] & mask)) continue;
+                
+                // Simple redundant check avoidance
+                bool alreadyChecked = false;
+                for (uint8_t c = 0; c < numChecked; c++) {
+                    if (checkedBodies[c] == i) { alreadyChecked = true; break; }
+                }
+                if (alreadyChecked) continue;
+                if (numChecked < 32) checkedBodies[numChecked++] = i;
+
+                if (w->shapes[i].type == FS_CIRCLE) {
+                    fsVec2 m = fsSub(start, w->positions[i]);
+                    float c = fsDot(m, m) - w->shapes[i].circle.radius * w->shapes[i].circle.radius;
+                    float b_dot = fsDot(m, dir);
+                    if (c > 0.0f && b_dot > 0.0f) continue;
+                    float discr = b_dot * b_dot - c;
+                    if (discr < 0.0f) continue;
+                    float t = -b_dot - sqrtf(discr);
+                    if (t < 0.0f) t = 0.0f;
+                    float f = t * invDirLen;
+                    if (f < minFraction) {
+                        minFraction = f;
+                        out->bodyIndex = i;
+                        out->point = fsAdd(start, fsMul(dir, f));
+                        out->normal = fsNormalize(fsSub(out->point, w->positions[i]));
+                        out->fraction = f;
+                        hit = true;
+                    }
+                } else if (w->shapes[i].type == FS_BOX) {
+                    // Ray-Box AABB intersection for simplicity (Impulse Wars usually uses AABBs)
+                    fsVec2 boxMin = fsSub(w->positions[i], w->shapes[i].box.halfExtents);
+                    fsVec2 boxMax = fsAdd(w->positions[i], w->shapes[i].box.halfExtents);
+                    float t1 = (boxMin.x - start.x) / (dir.x + FLT_EPSILON);
+                    float t2 = (boxMax.x - start.x) / (dir.x + FLT_EPSILON);
+                    float t3 = (boxMin.y - start.y) / (dir.y + FLT_EPSILON);
+                    float t4 = (boxMax.y - start.y) / (dir.y + FLT_EPSILON);
+                    float tmin = fmaxf(fminf(t1, t2), fminf(t3, t4));
+                    float tmax = fminf(fmaxf(t1, t2), fmaxf(t3, t4));
+                    if (tmax >= 0 && tmin <= tmax) {
+                        float f = tmin * invDirLen;
+                        if (f < minFraction) {
+                            minFraction = f;
+                            out->bodyIndex = i;
+                            out->point = fsAdd(start, fsMul(dir, f));
+                            out->fraction = f;
+                            out->normal = (fsVec2){0, 0}; // TODO: box normal
+                            hit = true;
+                        }
+                    }
+                }
             }
         }
-        // TODO: Ray-Box if needed, but mostly walls are circles/boxes.
-        // impulse wars uses AABBs for walls mostly.
     }
     return hit;
 }
